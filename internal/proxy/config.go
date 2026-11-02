@@ -16,9 +16,10 @@ const (
 
 // Config is the optional JSON file loaded by -config.
 type Config struct {
-	Port     int    `json:"port"`
-	Password string `json:"password"`
-	Bin      string `json:"bin"`
+	Port         int               `json:"port"`
+	Password     string            `json:"password"`
+	Bin          string            `json:"bin"`
+	ModelAliases map[string]string `json:"model_aliases"`
 }
 
 func LoadConfig(path string) (Config, error) {

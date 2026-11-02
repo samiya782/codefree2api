@@ -1,5 +1,8 @@
 {
   "port": 8000,
   "password": "",
-  "bin": "/home/samiya/.local/share/mise/installs/node/24.22.0/bin/codefree-o"
+  "bin": "/home/samiya/.local/share/mise/installs/node/24.22.0/bin/codefree-o",
+  "model_aliases": {
+    "sonnet": "codefree/GLM-5.2"
+  }
 }

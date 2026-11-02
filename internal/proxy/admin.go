@@ -40,8 +40,14 @@ var adminTmpl = template.Must(template.New("admin").Parse(`<!DOCTYPE html>
   {{if .Models}}
   <ul>{{range .Models}}<li><code>{{.}}</code></li>{{end}}</ul>
   {{else}}
-  <p class="muted">暂无模型（执行 <code>codefree-o models --pure</code> 未解析到 codefree/ 前缀）。</p>
+  <p class="muted">暂无模型。上游 provider 列表里没有 codefree 模型。</p>
   {{end}}
+  <h2>累计</h2>
+  <dl>
+    <dt>请求</dt><dd>{{.Stats.Requests}}（成功 {{.Stats.OK}}，失败 {{.Stats.Errors}}）</dd>
+    <dt>输入 token</dt><dd>{{.Stats.InputTokens}}</dd>
+    <dt>输出 token</dt><dd>{{.Stats.OutputTokens}}</dd>
+  </dl>
   <h2>最近一次调用</h2>
   {{if .HasLast}}
   <dl>
@@ -49,6 +55,7 @@ var adminTmpl = template.Must(template.New("admin").Parse(`<!DOCTYPE html>
     <dt>端点</dt><dd><code>{{.Last.Endpoint}}</code></dd>
     <dt>模型</dt><dd><code>{{.Last.Model}}</code></dd>
     <dt>耗时</dt><dd>{{.LastDur}}</dd>
+    <dt>token</dt><dd>in {{.Last.InputTokens}} / out {{.Last.OutputTokens}}</dd>
     <dt>状态</dt>
     <dd>{{if .Last.OK}}<span class="ok">成功</span>{{else}}<span class="err">失败</span>{{end}}</dd>
     {{if .Last.Error}}<dt>错误</dt><dd class="err">{{.Last.Error}}</dd>{{end}}
@@ -68,20 +75,26 @@ type adminData struct {
 	Last      LastCall
 	LastAt    string
 	LastDur   string
+	Stats     Stats
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
-	last, cached := s.snapshot()
+	last, cached, stats := s.snapshot()
 	models := cached
 	modelsErr := ""
 	ctx, cancel := context.WithTimeout(r.Context(), listTimeout)
 	defer cancel()
-	if live, err := s.runner.ListModels(ctx); err != nil {
+	if live, err := s.engine.Models(ctx); err != nil {
 		modelsErr = err.Error()
 	} else {
-		models = live
+		models = make([]string, 0, len(live))
+		for _, m := range live {
+			if m.ID != "" {
+				models = append(models, m.ID)
+			}
+		}
 		s.mu.Lock()
-		s.modelCache = append([]string(nil), live...)
+		s.modelCache = append([]string(nil), models...)
 		s.mu.Unlock()
 	}
 
@@ -92,6 +105,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		ModelsErr: modelsErr,
 		HasLast:   !last.At.IsZero(),
 		Last:      last,
+		Stats:     stats,
 	}
 	if data.HasLast {
 		data.LastAt = last.At.Format(time.RFC3339)

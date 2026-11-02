@@ -134,7 +134,7 @@ go build -o codefree2api ./cmd/codefree2api
 
 普通对话每次会把完整历史放进新 session。只有 Responses 的 `previous_response_id` 会接着上次的上游 session，并且只发送这次的新输入。
 
-上游单次调用超时 10 分钟。`codefree-o` 由 `exec.Command` 启动，不走 shell。
+上游单次调用超时 10 分钟。`codefree-o` 由 `exec.Command` 启动，不走 shell。代理收到 SIGINT 或 SIGTERM 时，以及 `launch` 的客户端退出时，会关掉这个 serve 子进程。
 
 ## curl 示例
 

@@ -1,15 +1,11 @@
 package proxy
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
-	"time"
 )
 
 type httpError struct {
@@ -786,92 +782,6 @@ func appendHint(system, hint string) string {
 	return system + "\n\n" + hint
 }
 
-func materializeFiles(dir string, files []FileRef) ([]FileRef, error) {
-	if len(files) == 0 {
-		return nil, nil
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	out := make([]FileRef, 0, len(files))
-	for i, f := range files {
-		if strings.HasPrefix(f.URL, "data:") {
-			mime, raw, ok := decodeDataURL(f.URL)
-			if !ok {
-				return nil, badRequest("messages", "unsupported file data URL")
-			}
-			if f.MIME == "" {
-				f.MIME = mime
-			}
-			name := filepath.Base(f.Name)
-			if name == "" || name == "." || name == string(filepath.Separator) {
-				name = fmt.Sprintf("attach-%d%s", i, extForMIME(f.MIME))
-			}
-			path := filepath.Join(dir, fmt.Sprintf("%d-%s", time.Now().UnixNano(), name))
-			if err := os.WriteFile(path, raw, 0o600); err != nil {
-				return nil, err
-			}
-			f.URL = "file://" + path
-			f.Name = name
-		}
-		if f.MIME == "" {
-			f.MIME = "application/octet-stream"
-		}
-		if strings.TrimSpace(f.URL) == "" {
-			continue
-		}
-		out = append(out, f)
-	}
-	return out, nil
-}
-
-func decodeDataURL(s string) (string, []byte, bool) {
-	if !strings.HasPrefix(s, "data:") {
-		return "", nil, false
-	}
-	rest := strings.TrimPrefix(s, "data:")
-	comma := strings.IndexByte(rest, ',')
-	if comma < 0 {
-		return "", nil, false
-	}
-	meta, payload := rest[:comma], rest[comma+1:]
-	if !strings.Contains(strings.ToLower(meta), ";base64") {
-		return "", nil, false
-	}
-	mime := meta
-	if i := strings.IndexByte(mime, ';'); i >= 0 {
-		mime = mime[:i]
-	}
-	if mime == "" {
-		mime = "application/octet-stream"
-	}
-	raw, err := base64.StdEncoding.DecodeString(payload)
-	if err != nil {
-		raw, err = base64.RawStdEncoding.DecodeString(payload)
-		if err != nil {
-			return "", nil, false
-		}
-	}
-	return mime, raw, true
-}
-
-func extForMIME(mime string) string {
-	switch strings.ToLower(mime) {
-	case "image/png":
-		return ".png"
-	case "image/jpeg":
-		return ".jpg"
-	case "image/gif":
-		return ".gif"
-	case "image/webp":
-		return ".webp"
-	case "application/pdf":
-		return ".pdf"
-	default:
-		return ".bin"
-	}
-}
-
 func splitModel(model string) (provider, id string) {
 	model = strings.TrimSpace(model)
 	if i := strings.IndexByte(model, '/'); i > 0 && i < len(model)-1 {
@@ -975,136 +885,6 @@ func fencedJSON(s string) string {
 		return ""
 	}
 	return strings.TrimSpace(rest[:end])
-}
-
-func openAIFinish(finish string) string {
-	switch finish {
-	case "tool_calls":
-		return "tool_calls"
-	case "length":
-		return "length"
-	case "content_filter":
-		return "content_filter"
-	default:
-		return "stop"
-	}
-}
-
-func anthropicStop(finish, matched string) (string, any) {
-	switch finish {
-	case "tool_calls":
-		return "tool_use", nil
-	case "length":
-		return "max_tokens", nil
-	case "stop_sequence":
-		return "stop_sequence", matched
-	default:
-		return "end_turn", nil
-	}
-}
-
-func usageMap(u Usage) map[string]any {
-	out := map[string]any{
-		"prompt_tokens":     u.Input,
-		"completion_tokens": u.Completion(),
-		"total_tokens":      u.Total(),
-	}
-	if u.CacheRead > 0 {
-		out["prompt_tokens_details"] = map[string]int{"cached_tokens": u.CacheRead}
-	}
-	if u.Reasoning > 0 {
-		out["completion_tokens_details"] = map[string]int{"reasoning_tokens": u.Reasoning}
-	}
-	return out
-}
-
-func openAIMessage(text, reasoning string, tools []ToolCall) map[string]any {
-	msg := map[string]any{"role": "assistant"}
-	if text == "" && len(tools) > 0 {
-		msg["content"] = nil
-	} else {
-		msg["content"] = text
-	}
-	if reasoning != "" {
-		msg["reasoning_content"] = reasoning
-	}
-	if len(tools) > 0 {
-		msg["tool_calls"] = openAIToolCalls(tools)
-	}
-	return msg
-}
-
-func openAIToolCalls(tools []ToolCall) []map[string]any {
-	out := make([]map[string]any, 0, len(tools))
-	for _, tc := range tools {
-		out = append(out, map[string]any{
-			"id":   tc.ID,
-			"type": "function",
-			"function": map[string]any{
-				"name":      tc.Name,
-				"arguments": tc.Arguments,
-			},
-		})
-	}
-	return out
-}
-
-func anthropicContent(text, reasoning string, tools []ToolCall) []map[string]any {
-	var out []map[string]any
-	if reasoning != "" {
-		out = append(out, map[string]any{"type": "thinking", "thinking": reasoning})
-	}
-	if text != "" || (reasoning == "" && len(tools) == 0) {
-		out = append(out, map[string]any{"type": "text", "text": text})
-	}
-	for _, tc := range tools {
-		var input any
-		if err := json.Unmarshal([]byte(tc.Arguments), &input); err != nil {
-			input = map[string]any{}
-		}
-		out = append(out, map[string]any{
-			"type":  "tool_use",
-			"id":    tc.ID,
-			"name":  tc.Name,
-			"input": input,
-		})
-	}
-	return out
-}
-
-func responseOutput(text, reasoning string, tools []ToolCall) []any {
-	var out []any
-	if reasoning != "" {
-		out = append(out, map[string]any{
-			"type": "reasoning",
-			"id":   newID("rs"),
-			"summary": []map[string]any{
-				{"type": "summary_text", "text": reasoning},
-			},
-		})
-	}
-	if text != "" || len(tools) == 0 {
-		out = append(out, map[string]any{
-			"type":   "message",
-			"id":     newID("msg"),
-			"role":   "assistant",
-			"status": "completed",
-			"content": []map[string]any{
-				{"type": "output_text", "text": text, "annotations": []any{}},
-			},
-		})
-	}
-	for _, tc := range tools {
-		out = append(out, map[string]any{
-			"type":      "function_call",
-			"id":        newID("fc"),
-			"call_id":   tc.ID,
-			"name":      tc.Name,
-			"arguments": tc.Arguments,
-			"status":    "completed",
-		})
-	}
-	return out
 }
 
 func countTurnTokens(turn Turn) int {

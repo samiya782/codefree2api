@@ -91,34 +91,114 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) finishOpenAI(w http.ResponseWriter, r *http.Request, turn Turn) {
+	s.finishTurn(w, r, "/v1/chat/completions", false, turn, func(res RunResult) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":      newID("chatcmpl"),
+			"object":  "chat.completion",
+			"created": createdUnix(),
+			"model":   turn.Model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       openAIMessage(res.Text, res.Reasoning, res.Tools),
+				"finish_reason": openAIFinish(res.Finish),
+			}},
+			"usage": usageMap(res.Usage),
+		})
+	})
+}
+
+func (s *Server) streamOpenAI(w http.ResponseWriter, r *http.Request, turn Turn, includeUsage bool) {
+	s.streamTurn(w, r, "/v1/chat/completions", false, turn, func(fl http.Flusher) turnSink {
+		id := newID("chatcmpl")
+		if first, err := openaiChunkJSON(id, turn.Model, "assistant", "", nil); err == nil {
+			_ = WriteSSEData(w, first)
+			flush(fl)
+		}
+		return &openAIStream{w: w, fl: fl, id: id, model: turn.Model, includeUsage: includeUsage}
+	})
+}
+
+func (s *Server) finishAnthropic(w http.ResponseWriter, r *http.Request, turn Turn) {
+	s.finishTurn(w, r, "/v1/messages", true, turn, func(res RunResult) {
+		reason, seq := anthropicStop(res.Finish, res.StopMatch)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":            newID("msg"),
+			"type":          "message",
+			"role":          "assistant",
+			"model":         turn.Model,
+			"content":       anthropicContent(res.Text, res.Reasoning, res.Tools),
+			"stop_reason":   reason,
+			"stop_sequence": seq,
+			"usage": map[string]int{
+				"input_tokens":  res.Usage.Input,
+				"output_tokens": res.Usage.Completion(),
+			},
+		})
+	})
+}
+
+func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, turn Turn) {
+	s.streamTurn(w, r, "/v1/messages", true, turn, func(fl http.Flusher) turnSink {
+		id := newID("msg")
+		_ = WriteSSEEvent(w, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": id, "type": "message", "role": "assistant", "model": turn.Model,
+				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+				"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
+			},
+		})
+		flush(fl)
+		return &anthropicStream{w: w, fl: fl, blocks: anthStream{w: w, fl: fl}}
+	})
+}
+
+func (s *Server) finishResponses(w http.ResponseWriter, r *http.Request, turn Turn) {
+	s.finishTurn(w, r, "/v1/responses", false, turn, func(res RunResult) {
+		id := newID("resp")
+		s.remember(id, res.SessionID)
+		writeJSON(w, http.StatusOK, responseObject(id, turn.Model, res))
+	})
+}
+
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, turn Turn) {
+	s.streamTurn(w, r, "/v1/responses", false, turn, func(fl http.Flusher) turnSink {
+		id := newID("resp")
+		created := responseObject(id, turn.Model, RunResult{Finish: "stop"})
+		created["status"] = "in_progress"
+		created["output"] = []any{}
+		_ = WriteSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": created})
+		flush(fl)
+		return &responsesStream{w: w, fl: fl, srv: s, id: id, model: turn.Model}
+	})
+}
+
+func (s *Server) finishTurn(w http.ResponseWriter, r *http.Request, endpoint string, anthropic bool, turn Turn, write func(RunResult)) {
 	ctx, cancel := context.WithTimeout(r.Context(), runTimeout)
 	defer cancel()
 	start := time.Now()
 	res, err := s.execute(ctx, turn, nil)
 	if err != nil {
-		s.note("/v1/chat/completions", turn.Model, false, err.Error(), time.Since(start), Usage{})
-		writeHTTPError(w, false, err)
+		s.note(endpoint, turn.Model, false, err.Error(), time.Since(start), Usage{})
+		writeHTTPError(w, anthropic, err)
 		return
 	}
 	res = limitResult(res, turn)
-	s.note("/v1/chat/completions", turn.Model, true, "", time.Since(start), res.Usage)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":      newID("chatcmpl"),
-		"object":  "chat.completion",
-		"created": createdUnix(),
-		"model":   turn.Model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"message":       openAIMessage(res.Text, res.Reasoning, res.Tools),
-			"finish_reason": openAIFinish(res.Finish),
-		}},
-		"usage": usageMap(res.Usage),
-	})
+	s.note(endpoint, turn.Model, true, "", time.Since(start), res.Usage)
+	write(res)
 }
 
-func (s *Server) streamOpenAI(w http.ResponseWriter, r *http.Request, turn Turn, includeUsage bool) {
+type turnSink interface {
+	reasoning(string) error
+	text(string) error
+	tools([]ToolCall) error
+	finish(RunResult) error
+	fail(error)
+}
+
+func (s *Server) streamTurn(w http.ResponseWriter, r *http.Request, endpoint string, anthropic bool, turn Turn, prepare func(http.Flusher) turnSink) {
 	if strings.TrimSpace(turn.Model) == "" {
-		writeHTTPError(w, false, badRequest("model", "model is required"))
+		writeHTTPError(w, anthropic, badRequest("model", "model is required"))
 		return
 	}
 	fl := flushOf(w)
@@ -127,12 +207,8 @@ func (s *Server) streamOpenAI(w http.ResponseWriter, r *http.Request, turn Turn,
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	flush(fl)
+	sink := prepare(fl)
 
-	id := newID("chatcmpl")
-	if first, err := openaiChunkJSON(id, turn.Model, "assistant", "", nil); err == nil {
-		_ = WriteSSEData(w, first)
-		flush(fl)
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), runTimeout)
 	defer cancel()
 	lim := newLimiter(turn.Stop, turn.MaxTokens)
@@ -140,27 +216,17 @@ func (s *Server) streamOpenAI(w http.ResponseWriter, r *http.Request, turn Turn,
 	start := time.Now()
 	res, err := s.execute(ctx, turn, func(d Delta) error {
 		if d.Reasoning != "" {
-			payload, err := openaiDelta(id, turn.Model, map[string]any{"reasoning_content": d.Reasoning}, nil, nil)
-			if err != nil {
+			if err := sink.reasoning(d.Reasoning); err != nil {
 				return err
 			}
-			if err := WriteSSEData(w, payload); err != nil {
-				return err
-			}
-			flush(fl)
 		}
 		if d.Text != "" {
 			piece, done := lim.Push(d.Text)
 			if piece != "" {
 				streamed = true
-				payload, err := openaiChunkJSON(id, turn.Model, "", piece, nil)
-				if err != nil {
+				if err := sink.text(piece); err != nil {
 					return err
 				}
-				if err := WriteSSEData(w, payload); err != nil {
-					return err
-				}
-				flush(fl)
 			}
 			if done {
 				cancel()
@@ -170,35 +236,69 @@ func (s *Server) streamOpenAI(w http.ResponseWriter, r *http.Request, turn Turn,
 	})
 	if tail := lim.Flush(); tail != "" {
 		streamed = true
-		if payload, err := openaiChunkJSON(id, turn.Model, "", tail, nil); err == nil {
-			_ = WriteSSEData(w, payload)
-			flush(fl)
-		}
+		_ = sink.text(tail)
 	}
 	if err != nil && !lim.done {
-		s.note("/v1/chat/completions", turn.Model, false, err.Error(), time.Since(start), Usage{})
-		errPayload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
-		_ = WriteSSEData(w, string(errPayload))
-		_ = WriteSSEDone(w)
-		flush(fl)
+		s.note(endpoint, turn.Model, false, err.Error(), time.Since(start), Usage{})
+		sink.fail(err)
 		return
 	}
 	if lim.done {
 		res.Finish = lim.finish
 		res.StopMatch = lim.matched
 		res.Text = lim.Text()
-		err = nil
 	}
 	if !streamed && res.Text != "" && !lim.done {
-		writeLimitedText(w, fl, id, turn.Model, res.Text, lim)
+		for _, part := range chunkRunes(res.Text, 48) {
+			piece, done := lim.Push(part)
+			if piece != "" {
+				_ = sink.text(piece)
+			}
+			if done {
+				break
+			}
+		}
+		if tail := lim.Flush(); tail != "" {
+			_ = sink.text(tail)
+		}
 		res.Text = lim.Text()
 		if lim.done {
 			res.Finish = lim.finish
 			res.StopMatch = lim.matched
 		}
 	}
-	for i, tc := range res.Tools {
-		payload, err := openaiDelta(id, turn.Model, map[string]any{
+	_ = sink.tools(res.Tools)
+	_ = sink.finish(res)
+	s.note(endpoint, turn.Model, true, "", time.Since(start), res.Usage)
+}
+
+type openAIStream struct {
+	w            http.ResponseWriter
+	fl           http.Flusher
+	id           string
+	model        string
+	includeUsage bool
+}
+
+func (o *openAIStream) reasoning(s string) error {
+	return o.delta(map[string]any{"reasoning_content": s}, nil, nil)
+}
+
+func (o *openAIStream) text(s string) error {
+	payload, err := openaiChunkJSON(o.id, o.model, "", s, nil)
+	if err != nil {
+		return err
+	}
+	if err := WriteSSEData(o.w, payload); err != nil {
+		return err
+	}
+	flush(o.fl)
+	return nil
+}
+
+func (o *openAIStream) tools(calls []ToolCall) error {
+	for i, tc := range calls {
+		_ = o.delta(map[string]any{
 			"tool_calls": []map[string]any{{
 				"index": i,
 				"id":    tc.ID,
@@ -209,183 +309,47 @@ func (s *Server) streamOpenAI(w http.ResponseWriter, r *http.Request, turn Turn,
 				},
 			}},
 		}, nil, nil)
-		if err == nil {
-			_ = WriteSSEData(w, payload)
-			flush(fl)
-		}
 	}
+	return nil
+}
+
+func (o *openAIStream) finish(res RunResult) error {
 	finish := openAIFinish(res.Finish)
 	var usage any
-	if includeUsage {
+	if o.includeUsage {
 		usage = usageMap(res.Usage)
 	}
-	if last, err := openaiDelta(id, turn.Model, map[string]any{}, &finish, usage); err == nil {
-		_ = WriteSSEData(w, last)
-	}
-	_ = WriteSSEDone(w)
-	flush(fl)
-	s.note("/v1/chat/completions", turn.Model, true, "", time.Since(start), res.Usage)
+	_ = o.delta(map[string]any{}, &finish, usage)
+	_ = WriteSSEDone(o.w)
+	flush(o.fl)
+	return nil
 }
 
-func writeLimitedText(w http.ResponseWriter, fl http.Flusher, id, model, text string, lim *limiter) {
-	for _, part := range chunkRunes(text, 48) {
-		piece, done := lim.Push(part)
-		if piece != "" {
-			if payload, err := openaiChunkJSON(id, model, "", piece, nil); err == nil {
-				_ = WriteSSEData(w, payload)
-				flush(fl)
-			}
-		}
-		if done {
-			return
-		}
-	}
-	if tail := lim.Flush(); tail != "" {
-		if payload, err := openaiChunkJSON(id, model, "", tail, nil); err == nil {
-			_ = WriteSSEData(w, payload)
-			flush(fl)
-		}
-	}
+func (o *openAIStream) fail(err error) {
+	errPayload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
+	_ = WriteSSEData(o.w, string(errPayload))
+	_ = WriteSSEDone(o.w)
+	flush(o.fl)
 }
 
-func (s *Server) finishAnthropic(w http.ResponseWriter, r *http.Request, turn Turn) {
-	ctx, cancel := context.WithTimeout(r.Context(), runTimeout)
-	defer cancel()
-	start := time.Now()
-	res, err := s.execute(ctx, turn, nil)
+func (o *openAIStream) delta(delta map[string]any, finish *string, usage any) error {
+	payload, err := openaiDelta(o.id, o.model, delta, finish, usage)
 	if err != nil {
-		s.note("/v1/messages", turn.Model, false, err.Error(), time.Since(start), Usage{})
-		writeHTTPError(w, true, err)
-		return
+		return err
 	}
-	res = limitResult(res, turn)
-	s.note("/v1/messages", turn.Model, true, "", time.Since(start), res.Usage)
-	reason, seq := anthropicStop(res.Finish, res.StopMatch)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":            newID("msg"),
-		"type":          "message",
-		"role":          "assistant",
-		"model":         turn.Model,
-		"content":       anthropicContent(res.Text, res.Reasoning, res.Tools),
-		"stop_reason":   reason,
-		"stop_sequence": seq,
-		"usage": map[string]int{
-			"input_tokens":  res.Usage.Input,
-			"output_tokens": res.Usage.Completion(),
-		},
-	})
-}
-
-func (s *Server) streamAnthropic(w http.ResponseWriter, r *http.Request, turn Turn) {
-	if strings.TrimSpace(turn.Model) == "" {
-		writeHTTPError(w, true, badRequest("model", "model is required"))
-		return
+	if err := WriteSSEData(o.w, payload); err != nil {
+		return err
 	}
-	fl := flushOf(w)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flush(fl)
-
-	id := newID("msg")
-	_ = WriteSSEEvent(w, "message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id": id, "type": "message", "role": "assistant", "model": turn.Model,
-			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]int{"input_tokens": 0, "output_tokens": 0},
-		},
-	})
-	flush(fl)
-
-	ctx, cancel := context.WithTimeout(r.Context(), runTimeout)
-	defer cancel()
-	st := &anthStream{w: w, fl: fl}
-	lim := newLimiter(turn.Stop, turn.MaxTokens)
-	start := time.Now()
-	var streamed bool
-	res, err := s.execute(ctx, turn, func(d Delta) error {
-		if d.Reasoning != "" {
-			if err := st.reasoning(d.Reasoning); err != nil {
-				return err
-			}
-		}
-		if d.Text != "" {
-			piece, done := lim.Push(d.Text)
-			if piece != "" {
-				streamed = true
-				if err := st.text(piece); err != nil {
-					return err
-				}
-			}
-			if done {
-				cancel()
-			}
-		}
-		return nil
-	})
-	if tail := lim.Flush(); tail != "" {
-		streamed = true
-		_ = st.text(tail)
-	}
-	if err != nil && !lim.done {
-		s.note("/v1/messages", turn.Model, false, err.Error(), time.Since(start), Usage{})
-		_ = WriteSSEEvent(w, "error", map[string]any{
-			"type":  "error",
-			"error": map[string]any{"type": "upstream_error", "message": err.Error()},
-		})
-		_ = WriteSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"})
-		flush(fl)
-		return
-	}
-	if lim.done {
-		res.Finish = lim.finish
-		res.StopMatch = lim.matched
-		err = nil
-	}
-	if !streamed && res.Text != "" && !lim.done {
-		for _, part := range chunkRunes(res.Text, 48) {
-			piece, done := lim.Push(part)
-			if piece != "" {
-				_ = st.text(piece)
-			}
-			if done {
-				res.Finish = lim.finish
-				res.StopMatch = lim.matched
-				break
-			}
-		}
-		if tail := lim.Flush(); tail != "" {
-			_ = st.text(tail)
-		}
-		if lim.done {
-			res.Finish = lim.finish
-			res.StopMatch = lim.matched
-		}
-	}
-	for _, tc := range res.Tools {
-		_ = st.tool(tc)
-	}
-	st.close()
-	reason, seq := anthropicStop(res.Finish, res.StopMatch)
-	_ = WriteSSEEvent(w, "message_delta", map[string]any{
-		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": reason, "stop_sequence": seq},
-		"usage": map[string]int{"output_tokens": res.Usage.Completion()},
-	})
-	_ = WriteSSEEvent(w, "message_stop", map[string]any{"type": "message_stop"})
-	flush(fl)
-	s.note("/v1/messages", turn.Model, true, "", time.Since(start), res.Usage)
+	flush(o.fl)
+	return nil
 }
 
 type anthStream struct {
-	w        io.Writer
-	fl       http.Flusher
-	index    int
-	open     bool
-	kind     string
-	toolOpen bool
+	w     io.Writer
+	fl    http.Flusher
+	index int
+	open  bool
+	kind  string
 }
 
 func (a *anthStream) start(kind string, block map[string]any) error {
@@ -472,144 +436,166 @@ func (a *anthStream) tool(tc ToolCall) error {
 	return err
 }
 
-func (s *Server) finishResponses(w http.ResponseWriter, r *http.Request, turn Turn) {
-	ctx, cancel := context.WithTimeout(r.Context(), runTimeout)
-	defer cancel()
-	start := time.Now()
-	res, err := s.execute(ctx, turn, nil)
-	if err != nil {
-		s.note("/v1/responses", turn.Model, false, err.Error(), time.Since(start), Usage{})
-		writeHTTPError(w, false, err)
-		return
-	}
-	res = limitResult(res, turn)
-	s.note("/v1/responses", turn.Model, true, "", time.Since(start), res.Usage)
-	id := newID("resp")
-	s.remember(id, res.SessionID)
-	writeJSON(w, http.StatusOK, responseObject(id, turn.Model, res))
+type anthropicStream struct {
+	w      http.ResponseWriter
+	fl     http.Flusher
+	blocks anthStream
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, turn Turn) {
-	if strings.TrimSpace(turn.Model) == "" {
-		writeHTTPError(w, false, badRequest("model", "model is required"))
-		return
+func (a *anthropicStream) reasoning(s string) error { return a.blocks.reasoning(s) }
+func (a *anthropicStream) text(s string) error      { return a.blocks.text(s) }
+func (a *anthropicStream) tools(calls []ToolCall) error {
+	for _, tc := range calls {
+		if err := a.blocks.tool(tc); err != nil {
+			return err
+		}
 	}
-	fl := flushOf(w)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flush(fl)
+	return nil
+}
 
-	id := newID("resp")
-	ctx, cancel := context.WithTimeout(r.Context(), runTimeout)
-	defer cancel()
-	created := responseObject(id, turn.Model, RunResult{Finish: "stop"})
-	created["status"] = "in_progress"
-	created["output"] = []any{}
-	_ = WriteSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": created})
-	flush(fl)
+func (a *anthropicStream) finish(res RunResult) error {
+	a.blocks.close()
+	reason, seq := anthropicStop(res.Finish, res.StopMatch)
+	_ = WriteSSEEvent(a.w, "message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": reason, "stop_sequence": seq},
+		"usage": map[string]int{"output_tokens": res.Usage.Completion()},
+	})
+	_ = WriteSSEEvent(a.w, "message_stop", map[string]any{"type": "message_stop"})
+	flush(a.fl)
+	return nil
+}
 
-	lim := newLimiter(turn.Stop, turn.MaxTokens)
-	msgID := newID("msg")
-	var opened bool
-	var streamed bool
-	start := time.Now()
-	ensure := func() {
-		if opened {
-			return
-		}
-		opened = true
-		item := map[string]any{
-			"type": "message", "id": msgID, "role": "assistant", "status": "in_progress",
-			"content": []any{},
-		}
-		_ = WriteSSEEvent(w, "response.output_item.added", map[string]any{
-			"type": "response.output_item.added", "output_index": 0, "item": item,
+func (a *anthropicStream) fail(err error) {
+	_ = WriteSSEEvent(a.w, "error", map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "upstream_error", "message": err.Error()},
+	})
+	_ = WriteSSEEvent(a.w, "message_stop", map[string]any{"type": "message_stop"})
+	flush(a.fl)
+}
+
+type responsesStream struct {
+	w            http.ResponseWriter
+	fl           http.Flusher
+	srv          *Server
+	id           string
+	model        string
+	msgID        string
+	next         int
+	msgIndex     int
+	reasonIndex  int
+	reasonID     string
+	msgOpen      bool
+	reasonOpen   bool
+	reasonClosed bool
+}
+
+func (e *responsesStream) reasoning(s string) error {
+	if !e.reasonOpen {
+		e.reasonOpen = true
+		e.reasonIndex = e.next
+		e.reasonID = newID("rs")
+		e.next++
+		_ = e.event("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": e.reasonIndex,
+			"item": map[string]any{"type": "reasoning", "id": e.reasonID, "summary": []any{}},
 		})
-		_ = WriteSSEEvent(w, "response.content_part.added", map[string]any{
-			"type": "response.content_part.added", "output_index": 0, "content_index": 0,
+	}
+	return e.event("response.reasoning_summary_text.delta", map[string]any{
+		"type": "response.reasoning_summary_text.delta", "output_index": e.reasonIndex, "delta": s,
+	})
+}
+
+func (e *responsesStream) text(piece string) error {
+	if piece == "" {
+		return nil
+	}
+	if !e.msgOpen {
+		e.msgOpen = true
+		e.msgIndex = e.next
+		e.next++
+		e.msgID = newID("msg")
+		_ = e.event("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "output_index": e.msgIndex,
+			"item": map[string]any{
+				"type": "message", "id": e.msgID, "role": "assistant", "status": "in_progress",
+				"content": []any{},
+			},
+		})
+		_ = e.event("response.content_part.added", map[string]any{
+			"type": "response.content_part.added", "output_index": e.msgIndex, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
 		})
-		flush(fl)
 	}
-	writeText := func(piece string) {
-		if piece == "" {
-			return
-		}
-		ensure()
-		streamed = true
-		_ = WriteSSEEvent(w, "response.output_text.delta", map[string]any{
-			"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": piece,
-		})
-		flush(fl)
-	}
-	res, err := s.execute(ctx, turn, func(d Delta) error {
-		if d.Text == "" {
-			return nil
-		}
-		piece, done := lim.Push(d.Text)
-		writeText(piece)
-		if done {
-			cancel()
-		}
-		return nil
+	return e.event("response.output_text.delta", map[string]any{
+		"type": "response.output_text.delta", "output_index": e.msgIndex, "content_index": 0, "delta": piece,
 	})
-	if tail := lim.Flush(); tail != "" {
-		writeText(tail)
+}
+
+func (e *responsesStream) tools(calls []ToolCall) error {
+	base := e.next
+	if base == 0 {
+		base = 1
 	}
-	if err != nil && !lim.done {
-		s.note("/v1/responses", turn.Model, false, err.Error(), time.Since(start), Usage{})
-		_ = WriteSSEEvent(w, "error", map[string]any{"type": "error", "error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
-		flush(fl)
-		return
-	}
-	if lim.done {
-		res.Finish = lim.finish
-		res.Text = lim.Text()
-	}
-	if !streamed && res.Text != "" && !lim.done {
-		for _, part := range chunkRunes(res.Text, 48) {
-			piece, done := lim.Push(part)
-			writeText(piece)
-			if done {
-				break
-			}
-		}
-		writeText(lim.Flush())
-		res.Text = lim.Text()
-		if lim.done {
-			res.Finish = lim.finish
-		}
-	}
-	if opened {
-		_ = WriteSSEEvent(w, "response.output_text.done", map[string]any{
-			"type": "response.output_text.done", "output_index": 0, "content_index": 0, "text": res.Text,
-		})
-		_ = WriteSSEEvent(w, "response.content_part.done", map[string]any{
-			"type": "response.content_part.done", "output_index": 0, "content_index": 0,
-			"part": map[string]any{"type": "output_text", "text": res.Text, "annotations": []any{}},
-		})
-		_ = WriteSSEEvent(w, "response.output_item.done", map[string]any{
-			"type": "response.output_item.done", "output_index": 0,
-			"item": map[string]any{"type": "message", "id": msgID, "role": "assistant", "status": "completed", "content": []map[string]any{{"type": "output_text", "text": res.Text, "annotations": []any{}}}},
-		})
-	}
-	for i, tc := range res.Tools {
+	for i, tc := range calls {
 		item := map[string]any{
 			"type": "function_call", "id": newID("fc"), "call_id": tc.ID, "name": tc.Name, "arguments": tc.Arguments, "status": "completed",
 		}
-		_ = WriteSSEEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": i + 1, "item": item})
-		_ = WriteSSEEvent(w, "response.function_call_arguments.done", map[string]any{
-			"type": "response.function_call_arguments.done", "output_index": i + 1, "arguments": tc.Arguments,
+		_ = e.event("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": base + i, "item": item})
+		_ = e.event("response.function_call_arguments.done", map[string]any{
+			"type": "response.function_call_arguments.done", "output_index": base + i, "arguments": tc.Arguments,
 		})
-		_ = WriteSSEEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": i + 1, "item": item})
+		_ = e.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": base + i, "item": item})
 	}
-	final := responseObject(id, turn.Model, res)
-	_ = WriteSSEEvent(w, "response.completed", map[string]any{"type": "response.completed", "response": final})
-	flush(fl)
-	s.remember(id, res.SessionID)
-	s.note("/v1/responses", turn.Model, true, "", time.Since(start), res.Usage)
+	return nil
+}
+
+func (e *responsesStream) finish(res RunResult) error {
+	e.closeReason(res.Reasoning)
+	if e.msgOpen {
+		_ = e.event("response.output_text.done", map[string]any{
+			"type": "response.output_text.done", "output_index": e.msgIndex, "content_index": 0, "text": res.Text,
+		})
+		_ = e.event("response.content_part.done", map[string]any{
+			"type": "response.content_part.done", "output_index": e.msgIndex, "content_index": 0,
+			"part": map[string]any{"type": "output_text", "text": res.Text, "annotations": []any{}},
+		})
+		_ = e.event("response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "output_index": e.msgIndex,
+			"item": map[string]any{
+				"type": "message", "id": e.msgID, "role": "assistant", "status": "completed",
+				"content": []map[string]any{{"type": "output_text", "text": res.Text, "annotations": []any{}}},
+			},
+		})
+	}
+	_ = e.event("response.completed", map[string]any{"type": "response.completed", "response": responseObject(e.id, e.model, res)})
+	e.srv.remember(e.id, res.SessionID)
+	return nil
+}
+
+func (e *responsesStream) fail(err error) {
+	_ = e.event("error", map[string]any{"type": "error", "error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
+}
+
+func (e *responsesStream) closeReason(text string) {
+	if !e.reasonOpen || e.reasonClosed {
+		return
+	}
+	e.reasonClosed = true
+	_ = e.event("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": e.reasonIndex,
+		"item": map[string]any{
+			"type": "reasoning", "id": e.reasonID,
+			"summary": []map[string]any{{"type": "summary_text", "text": text}},
+		},
+	})
+}
+
+func (e *responsesStream) event(name string, payload map[string]any) error {
+	err := WriteSSEEvent(e.w, name, payload)
+	flush(e.fl)
+	return err
 }
 
 func responseObject(id, model string, res RunResult) map[string]any {

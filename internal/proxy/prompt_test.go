@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -38,51 +37,5 @@ func TestExtractContentNullAndEmpty(t *testing.T) {
 	}
 	if got := ExtractContent(json.RawMessage("null")); got != "" {
 		t.Fatalf("null: %q", got)
-	}
-}
-
-func TestMessagesToPromptKeepsRoles(t *testing.T) {
-	msgs := []IncomingMessage{
-		{Role: "system", Content: raw("you are a tester")},
-		{Role: "user", Content: raw("ping")},
-		{Role: "assistant", Content: raw("pong")},
-		{Role: "user", Content: raw([]map[string]string{
-			{"type": "text", "text": "and "},
-			{"type": "text", "text": "again"},
-		})},
-	}
-	got := MessagesToPrompt(msgs, "")
-	want := strings.Join([]string{
-		"system: you are a tester",
-		"user: ping",
-		"assistant: pong",
-		"user: and again",
-	}, "\n\n")
-	if got != want {
-		t.Fatalf("prompt mismatch\nwant:\n%s\n\ngot:\n%s", want, got)
-	}
-}
-
-func TestMessagesToPromptPrependsAnthropicSystem(t *testing.T) {
-	msgs := []IncomingMessage{
-		{Role: "user", Content: raw("hi")},
-	}
-	got := MessagesToPrompt(msgs, "be brief")
-	if !strings.HasPrefix(got, "system: be brief") {
-		t.Fatalf("missing system prefix: %q", got)
-	}
-	if !strings.Contains(got, "user: hi") {
-		t.Fatalf("missing user: %q", got)
-	}
-}
-
-func TestMessagesToPromptSkipsEmpty(t *testing.T) {
-	msgs := []IncomingMessage{
-		{Role: "user", Content: raw("")},
-		{Role: "user", Content: raw("ok")},
-	}
-	got := MessagesToPrompt(msgs, "  ")
-	if got != "user: ok" {
-		t.Fatalf("got %q", got)
 	}
 }

@@ -401,6 +401,38 @@ func TestChatStreamDone(t *testing.T) {
 	}
 }
 
+func TestServerCloseIsIdempotent(t *testing.T) {
+	srv := newTestServer(t, &fakeEngine{}, "")
+	if srv.HTTPServer() != srv.HTTPServer() {
+		t.Fatal("HTTPServer created two servers")
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResponsesStreamKeepsReasoning(t *testing.T) {
+	eng := &fakeEngine{
+		deltas: []Delta{{Reasoning: "think"}, {Text: "pong"}},
+		result: RunResult{Text: "pong", Reasoning: "think", Usage: Usage{Input: 1, Output: 1}},
+	}
+	srv := newTestServer(t, eng, "")
+	rec := doJSON(t, srv, http.MethodPost, "/v1/responses", "", `{"model":"codefree/GLM-5.2","stream":true,"input":"ping"}`)
+	body := rec.Body.String()
+	if !strings.Contains(body, "response.reasoning_summary_text.delta") || !strings.Contains(body, "think") {
+		t.Fatalf("missing reasoning delta %s", body)
+	}
+	if !strings.Contains(body, "response.output_text.delta") || !strings.Contains(body, "pong") {
+		t.Fatalf("missing text delta %s", body)
+	}
+	if !strings.Contains(body, "response.completed") {
+		t.Fatalf("missing completed %s", body)
+	}
+}
+
 func TestLivePing(t *testing.T) {
 	if os.Getenv("CODEFREE2API_LIVE") != "1" {
 		t.Skip("set CODEFREE2API_LIVE=1 to ping a logged-in codefree-o")

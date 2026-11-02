@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -8,8 +10,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"codefree2api/internal/proxy"
@@ -72,8 +76,20 @@ func serve(opt proxy.Options) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", srv.Addr(), err)
 	}
+	hs := srv.HTTPServer()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
 	log.Printf("codefree2api listening on http://%s bin=%s", srv.Addr(), srv.Bin())
-	return srv.HTTPServer().Serve(ln)
+	err = hs.Serve(ln)
+	_ = srv.Close()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 func runLaunch(args []string) error {
@@ -92,8 +108,10 @@ func runLaunch(args []string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", srv.Addr(), err)
 	}
+	hs := srv.HTTPServer()
+	defer func() { _ = srv.Close() }()
 	go func() {
-		if err := srv.HTTPServer().Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := hs.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("proxy: %v", err)
 		}
 	}()

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -53,6 +54,7 @@ type Server struct {
 	aliases  map[string]string
 	engine   Engine
 	mux      *http.ServeMux
+	httpSrv  *http.Server
 
 	mu           sync.Mutex
 	last         LastCall
@@ -120,11 +122,40 @@ func (s *Server) Addr() string { return s.addr }
 func (s *Server) Bin() string  { return s.bin }
 
 func (s *Server) HTTPServer() *http.Server {
-	return &http.Server{
-		Addr:              s.addr,
-		Handler:           s,
-		ReadHeaderTimeout: 10 * time.Second,
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.httpSrv == nil {
+		s.httpSrv = &http.Server{
+			Addr:              s.addr,
+			Handler:           s,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
 	}
+	return s.httpSrv
+}
+
+// Close stops the HTTP server and the codefree-o child, if one was started.
+// It is safe to call more than once.
+func (s *Server) Close() error {
+	if c, ok := s.engine.(interface{ Close() }); ok {
+		c.Close()
+	}
+	s.mu.Lock()
+	hs := s.httpSrv
+	s.mu.Unlock()
+	if hs == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := hs.Shutdown(ctx)
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return hs.Close()
+	}
+	return err
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

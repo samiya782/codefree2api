@@ -134,7 +134,7 @@ func runLaunch(args []string) error {
 	if err != nil {
 		return fmt.Errorf("%s not found on PATH", spec.Name)
 	}
-	cmd := exec.Command(path, spec.Args...)
+	cmd := proxy.ExecCommand(path, spec.Args...)
 	cmd.Env = append(os.Environ(), spec.Env...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout

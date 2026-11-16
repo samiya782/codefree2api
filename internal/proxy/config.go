@@ -9,7 +9,9 @@ import (
 
 const (
 	DefaultPort = 8000
-	DefaultBin  = "/home/samiya/.local/share/mise/installs/node/24.22.0/bin/codefree-o"
+	// DefaultBin is looked up on PATH. On Windows an npm shim named
+	// codefree-o.cmd is followed to codefree-o.exe.
+	DefaultBin  = "codefree-o"
 	runTimeout  = 10 * time.Minute
 	listTimeout = 45 * time.Second
 )

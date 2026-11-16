@@ -34,7 +34,7 @@ func materializeFiles(dir string, files []FileRef) ([]FileRef, error) {
 			if err := os.WriteFile(path, raw, 0o600); err != nil {
 				return nil, err
 			}
-			f.URL = "file://" + path
+			f.URL = fileURL(path)
 			f.Name = name
 		}
 		if f.MIME == "" {

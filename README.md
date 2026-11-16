@@ -60,17 +60,20 @@
 
 ## 准备
 
-1. 本机已安装并可运行 `codefree-o`（默认路径见下方）。
-2. 已用 `codefree-o` 完成登录。本代理不会读取或导出 `~/.codefree-o` 下的凭据文件。
+1. 本机已安装并可运行 `codefree-o`。Windows 和 Linux / macOS 都是 npm 包 `@srdcloud/codefree-o`，安装后的可执行文件是 `codefree-o.exe`。
+2. 已用 `codefree-o` 完成登录。登录态在用户主目录的 `.codefree-o`（Windows 为 `%USERPROFILE%\.codefree-o`）。本代理不读取、不导出这个目录；子进程沿用当前用户的环境。
 3. Go 1.22+。
 
-默认二进制：
+默认从 `PATH` 查找 `codefree-o`。Windows 上 npm 全局安装给出的是 `%APPDATA%\npm\codefree-o.cmd`，代理会跟着这个 shim 找到旁边的 `node_modules\@srdcloud\codefree-o\bin\codefree-o.exe` 再直接执行。Volta 的 `codefree-o.cmd` 会解析到 `%LOCALAPPDATA%\Volta\tools\image\packages\@srdcloud\codefree-o` 里的 `codefree-o.exe`。项目内的 `node_modules\.bin\codefree-o.cmd` 会解析到同级包里的 `codefree-o.exe`。找不到 exe 时才用 `cmd.exe` 跑 `.cmd`。`-bin` 或配置文件可以写成命令名，也可以写成绝对路径。
 
-```
-/home/samiya/.local/share/mise/installs/node/24.22.0/bin/codefree-o
+Windows 安装示例：
+
+```bat
+npm install -g @srdcloud/codefree-o
+codefree-o
 ```
 
-可用 `-bin` 或配置文件覆盖。
+`%APPDATA%\npm` 需要在 `PATH` 里。
 
 ## 启动
 
@@ -79,11 +82,22 @@ go build -o codefree2api ./cmd/codefree2api
 ./codefree2api
 ```
 
+Windows 可在本机或从其他系统交叉编译：
+
+```bat
+go build -o codefree2api.exe .\cmd\codefree2api
+codefree2api.exe
+```
+
+```bash
+GOOS=windows GOARCH=amd64 go build -o codefree2api.exe ./cmd/codefree2api
+```
+
 常用参数：
 
 ```bash
 ./codefree2api -port 8000 -config config.json
-./codefree2api -bin /home/samiya/.local/share/mise/installs/node/24.22.0/bin/codefree-o
+./codefree2api -bin codefree-o
 ./codefree2api -password '本地口令'
 ```
 
@@ -92,7 +106,7 @@ go build -o codefree2api ./cmd/codefree2api
 | `-port` | `8000` | 仅监听 `127.0.0.1:<port>` |
 | `-config` | `config.json` | 可选 JSON；文件不存在则忽略 |
 | `-password` | 空 | 设置后除 `/health` 外要求 Bearer 或 `x-api-key` |
-| `-bin` | 见上 | 覆盖 `codefree-o` 路径 |
+| `-bin` | `codefree-o` | 命令名或绝对路径。Windows 上可以指向 `codefree-o.cmd` 或 `codefree-o.exe` |
 
 命令行显式传入的参数优先于配置文件。配置示例见 `config.example.json`：
 
@@ -100,7 +114,7 @@ go build -o codefree2api ./cmd/codefree2api
 {
   "port": 8000,
   "password": "",
-  "bin": "/home/samiya/.local/share/mise/installs/node/24.22.0/bin/codefree-o",
+  "bin": "codefree-o",
   "model_aliases": {
     "sonnet": "codefree/GLM-5.2"
   }
@@ -134,7 +148,7 @@ go build -o codefree2api ./cmd/codefree2api
 
 普通对话每次会把完整历史放进新 session。只有 Responses 的 `previous_response_id` 会接着上次的上游 session，并且只发送这次的新输入。
 
-上游单次调用超时 10 分钟。`codefree-o` 由 `exec.Command` 启动，不走 shell。代理收到 SIGINT 或 SIGTERM 时，以及 `launch` 的客户端退出时，会关掉这个 serve 子进程。
+上游单次调用超时 10 分钟。`codefree-o.exe` 由 `exec.Command` 直接启动。代理收到 SIGINT 或 SIGTERM（Windows 上是 Ctrl+C）时，以及 `launch` 的客户端退出时，会关掉这个 serve 子进程。Windows 上用 `taskkill /T` 结束整棵进程树。`launch claude` / `launch codex` 在 Windows 上如果 `PATH` 里是 `.cmd`，会经 `cmd.exe` 执行。
 
 ## curl 示例
 

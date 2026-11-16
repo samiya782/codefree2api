@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -852,10 +851,15 @@ func (c *Codefree) start(ctx context.Context) error {
 	if c.pass == "" {
 		c.pass = randomSecret()
 	}
-	cmd := exec.Command(c.bin(), "serve", "--pure", "--hostname", "127.0.0.1", "--port", "0")
+	bin, err := resolveExecutable(c.Bin)
+	if err != nil {
+		return err
+	}
+	// Background, not the request context: this child outlives the call that started it.
+	cmd := execCommandContext(context.Background(), bin, "serve", "--pure", "--hostname", "127.0.0.1", "--port", "0")
 	cmd.Dir = c.Dir
 	cmd.Env = serveEnv(c.pass)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	isolateProcess(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -924,15 +928,6 @@ func (c *Codefree) Close() {
 	c.cmd = nil
 	c.mu.Unlock()
 	killProcess(cmd)
-}
-
-func killProcess(cmd *exec.Cmd) {
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
-		_ = cmd.Process.Kill()
-	}
 }
 
 func serveEnv(password string) []string {

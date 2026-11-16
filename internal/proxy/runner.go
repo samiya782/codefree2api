@@ -27,17 +27,25 @@ func childEnv() []string {
 	return out
 }
 
-func (r *Runner) command(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, r.Bin, args...)
+func (r *Runner) command(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	path, err := resolveExecutable(r.Bin)
+	if err != nil {
+		return nil, err
+	}
+	cmd := execCommandContext(ctx, path, args...)
+	isolateProcess(cmd)
 	cmd.Env = childEnv()
 	if r.WorkDir != "" {
 		cmd.Dir = r.WorkDir
 	}
-	return cmd
+	return cmd, nil
 }
 
 func (r *Runner) ListModels(ctx context.Context) ([]string, error) {
-	cmd := r.command(ctx, "models", "--pure")
+	cmd, err := r.command(ctx, "models", "--pure")
+	if err != nil {
+		return nil, err
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()

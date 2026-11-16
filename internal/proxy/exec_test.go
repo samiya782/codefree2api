@@ -40,12 +40,9 @@ func TestBatchExePathExpandsDp0(t *testing.T) {
 	}
 }
 
-func TestBatchExePathReadsNpmShim(t *testing.T) {
-	dir := t.TempDir()
-	exe := filepath.Join(dir, "node_modules", "@srdcloud", "codefree-o", "bin", "codefree-o.exe")
-	cmd := filepath.Join(dir, "codefree-o.cmd")
-	// npm cmd-shim writes this when the bin target has no shebang.
-	text := "@ECHO off\r\n" +
+func npmGlobalCmd() string {
+	// npm cmd-shim output for a global bin with no shebang.
+	return "@ECHO off\r\n" +
 		"GOTO start\r\n" +
 		":find_dp0\r\n" +
 		"SET dp0=%~dp0\r\n" +
@@ -54,9 +51,91 @@ func TestBatchExePathReadsNpmShim(t *testing.T) {
 		"SETLOCAL\r\n" +
 		"CALL :find_dp0\r\n" +
 		`"%dp0%\node_modules\@srdcloud\codefree-o\bin\codefree-o.exe"   %*` + "\r\n"
-	got := batchExePath(cmd, text)
-	if got != exe {
-		t.Fatalf("got %s want %s", got, exe)
+}
+
+func npmLocalCmd() string {
+	// npm cmd-shim output for node_modules/.bin.
+	return "@ECHO off\r\n" +
+		"GOTO start\r\n" +
+		":find_dp0\r\n" +
+		"SET dp0=%~dp0\r\n" +
+		"EXIT /b\r\n" +
+		":start\r\n" +
+		"SETLOCAL\r\n" +
+		"CALL :find_dp0\r\n" +
+		`"%dp0%\..\@srdcloud\codefree-o\bin\codefree-o.exe"   %*` + "\r\n"
+}
+
+func TestBatchExePathReadsNpmShim(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "node_modules", "@srdcloud", "codefree-o", "bin", "codefree-o.exe")
+	cmd := filepath.Join(dir, "codefree-o.cmd")
+	if got := batchExePath(cmd, npmGlobalCmd()); got != exe {
+		t.Fatalf("global: got %s want %s", got, exe)
+	}
+	binDir := filepath.Join(dir, "node_modules", ".bin")
+	localExe := exe
+	localCmd := filepath.Join(binDir, "codefree-o.cmd")
+	if got := batchExePath(localCmd, npmLocalCmd()); got != localExe {
+		t.Fatalf("local: got %s want %s", got, localExe)
+	}
+}
+
+func TestResolveNpmShimText(t *testing.T) {
+	root := t.TempDir()
+	exe := filepath.Join(root, "npm", "node_modules", "@srdcloud", "codefree-o", "bin", "codefree-o.exe")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("exe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	globalCmd := filepath.Join(root, "npm", "codefree-o.cmd")
+	if err := os.WriteFile(globalCmd, []byte(npmGlobalCmd()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Extensionless file npm writes beside the .cmd.
+	if err := os.WriteFile(filepath.Join(root, "npm", "codefree-o"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{globalCmd, filepath.Join(root, "npm", "codefree-o"), filepath.Join(root, "npm", "codefree-o.ps1")} {
+		if filepath.Base(path) == "codefree-o.ps1" {
+			if err := os.WriteFile(path, []byte("ps1"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := resolveExecutable(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != exe {
+			t.Fatalf("%s: got %s want %s", path, got, exe)
+		}
+	}
+
+	// .cmd whose directory is not an npm prefix; only the %dp0% path inside it is valid.
+	shimDir := filepath.Join(root, "shims")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parsed := filepath.Join(root, "pkg", "bin", "codefree-o.exe")
+	if err := os.MkdirAll(filepath.Dir(parsed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(parsed, []byte("exe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parsedCmd := filepath.Join(shimDir, "codefree-o.cmd")
+	text := "@ECHO off\r\n" + ` "%dp0%\..\pkg\bin\codefree-o.exe" %*` + "\r\n"
+	if err := os.WriteFile(parsedCmd, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveExecutable(parsedCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != parsed {
+		t.Fatalf("parsed: got %s want %s", got, parsed)
 	}
 }
 

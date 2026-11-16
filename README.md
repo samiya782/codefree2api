@@ -209,12 +209,23 @@ OpenAI 兼容客户端把 `base_url` 设为 `http://127.0.0.1:8000/v1`，`api_ke
 ## 安全边界
 
 - **只绑定 `127.0.0.1`**，不接受外部网卡连接。不要把端口映射到公网。
-- **不读取、不打印、不导出** `~/.codefree-o` 下的凭据文件；子进程沿用当前用户已有登录态。
+- 代理进程**不读取、不打印、不导出** `~/.codefree-o` 下的凭据文件；子进程沿用当前用户已有登录态。`codefree2api lines` 会读取这份登录来上报，令牌不出现在输出里。
 - **不向 `codefree-o` 传递 `api_key`，不设置 `SRDCLOUD_*`。**
 - 给 `codefree-o serve` 的 Basic 口令是进程内随机值，只用于本机回环，不会写进响应。
 - 可选 Bearer / `x-api-key` 只保护本代理的 HTTP 接口，不是上游账号密码。未设置时本机进程即可调用，适合单人笔记本，不适合共享主机。
 - `/admin`、`/api/stats` 与业务接口使用同一套口令，没有后门。
 - 不要把 `config.json` 里的口令提交到 git。
+
+## codefree-o 代码行上报
+
+`codefree-o` 1.10.1 如何把增改行数发到研发云 `activity_record`，见 [docs/codefree-o-activity-record.md](docs/codefree-o-activity-record.md)。对话代理不组装这条上报。其他 harness 改完代码后执行：
+
+```bash
+codefree2api lines 8 3
+codefree2api lines --remote https://example.srdcloud.cn/group/repo 8 3
+```
+
+两个整数都由用户填写，命令不读取 diff。不写 `--remote` 时，要在被记入的仓库目录里执行，上报使用这个仓库的全部远端。`--remote` 可重复，写出之后上报只带这些地址，这时可以在别的目录执行。生成代码采纳行数为 0 时不上报。命令不设置 `SRDCLOUD_*`；环境里已经有完整的这一组变量时，上报使用那一份登录。词表和取舍见 [GLOSSARY.md](GLOSSARY.md) 与 [docs/adr/](docs/adr/)。
 
 ## 开发
 

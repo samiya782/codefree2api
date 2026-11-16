@@ -16,11 +16,21 @@ import (
 	"syscall"
 	"time"
 
+	"codefree2api/internal/lines"
 	"codefree2api/internal/proxy"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+	if len(os.Args) > 1 && os.Args[1] == "lines" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := lines.Run(ctx, os.Args[2:], lines.Options{Stdout: os.Stdout}); err != nil {
+			fmt.Fprintf(os.Stderr, "codefree2api: %s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "launch" {
 		if err := runLaunch(os.Args[2:]); err != nil {
 			log.Fatal(err)

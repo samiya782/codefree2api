@@ -643,7 +643,8 @@ func (s *Server) execute(ctx context.Context, turn Turn, emit func(Delta) error)
 	}
 	schema := toolSchema(turn.Tools, turn.ToolChoice)
 	system := turn.System
-	if schema != nil {
+	native, _ := s.engine.(interface{ NativeTools() bool })
+	if schema != nil && (native == nil || !native.NativeTools()) {
 		system = withToolInstructions(system, turn.Tools, turn.ToolChoice)
 	}
 	if turn.MaxTokens > 0 {
@@ -666,6 +667,8 @@ func (s *Server) execute(ctx context.Context, turn Turn, emit func(Delta) error)
 		ClientTools: schema != nil,
 		Schema:      schema,
 		SessionID:   turn.SessionID,
+		Tools:       turn.Tools,
+		ToolChoice:  turn.ToolChoice,
 	}, emit)
 	if err != nil {
 		return res, err

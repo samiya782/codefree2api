@@ -16,15 +16,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"codefree2api/internal/srd"
 )
 
 const maxBody = 32 << 20
 
 type Options struct {
-	Port     int
-	Password string
-	Bin      string
-	Aliases  map[string]string
+	Port          int
+	Password      string
+	Bin           string
+	Aliases       map[string]string
+	Client        string
+	PluginVersion string
+	EditorVersion string
+	SpaceVersion  string
 }
 
 type LastCall struct {
@@ -52,6 +58,7 @@ type Server struct {
 	bin      string
 	workDir  string
 	aliases  map[string]string
+	client   string
 	engine   Engine
 	mux      *http.ServeMux
 	httpSrv  *http.Server
@@ -65,6 +72,11 @@ type Server struct {
 }
 
 func New(opt Options) (*Server, error) {
+	kind, err := normalizeClient(opt.Client)
+	if err != nil {
+		return nil, err
+	}
+	opt.Client = kind
 	if opt.Bin == "" {
 		opt.Bin = DefaultBin
 	}
@@ -72,7 +84,23 @@ func New(opt Options) (*Server, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("work dir: %w", err)
 	}
-	return newServer(opt, &Codefree{Bin: opt.Bin, Dir: dir})
+	switch kind {
+	case "plugin":
+		return newServer(opt, &Plugin{
+			remote:        remote{App: srd.Plugin()},
+			EditorVersion: opt.EditorVersion,
+			PluginVersion: opt.PluginVersion,
+			Dir:           dir,
+		})
+	case "space":
+		return newServer(opt, &Space{
+			remote:  remote{App: srd.Space()},
+			Version: opt.SpaceVersion,
+			Dir:     dir,
+		})
+	default:
+		return newServer(opt, &Codefree{Bin: opt.Bin, Dir: dir})
+	}
 }
 
 func newServer(opt Options, eng Engine) (*Server, error) {
@@ -103,6 +131,7 @@ func newServer(opt Options, eng Engine) (*Server, error) {
 		bin:      opt.Bin,
 		workDir:  dir,
 		aliases:  aliases,
+		client:   opt.Client,
 		engine:   eng,
 		mux:      http.NewServeMux(),
 		sessions: map[string]string{},
@@ -120,6 +149,13 @@ func newServer(opt Options, eng Engine) (*Server, error) {
 
 func (s *Server) Addr() string { return s.addr }
 func (s *Server) Bin() string  { return s.bin }
+
+func (s *Server) Client() string {
+	if s.client == "" {
+		return "codefree-o"
+	}
+	return s.client
+}
 
 func (s *Server) HTTPServer() *http.Server {
 	s.mu.Lock()

@@ -72,6 +72,8 @@ type RunRequest struct {
 	ClientTools bool
 	Schema      map[string]any
 	SessionID   string
+	Tools       []ToolDef
+	ToolChoice  ToolChoice
 }
 
 type RunResult struct {

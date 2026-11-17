@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -18,10 +19,22 @@ import (
 
 	"codefree2api/internal/lines"
 	"codefree2api/internal/proxy"
+	"codefree2api/internal/srd"
 )
+
+var errLoginUsage = errors.New("用法：codefree2api login --client plugin|space")
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+	if len(os.Args) > 1 && os.Args[1] == "login" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := runLogin(ctx, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "codefree2api: %s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "lines" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -53,6 +66,10 @@ func optionsFromFlags(args []string) (proxy.Options, error) {
 	port := fs.Int("port", proxy.DefaultPort, "监听端口（仅 127.0.0.1）")
 	password := fs.String("password", "", "可选 Bearer 口令；未设置则本机免鉴权")
 	bin := fs.String("bin", "", "覆盖 codefree-o 可执行文件路径")
+	client := fs.String("client", "", "上游客户端：codefree-o、plugin 或 space")
+	pluginVersion := fs.String("plugin-version", "", "插件版本；设置后不再查询")
+	editorVersion := fs.String("editor-version", "", "编辑器版本；设置后不再执行 code --version")
+	spaceVersion := fs.String("space-version", "", "CodeFree Space 版本；设置后不再查询")
 	if err := fs.Parse(args); err != nil {
 		return proxy.Options{}, err
 	}
@@ -74,7 +91,16 @@ func optionsFromFlags(args []string) (proxy.Options, error) {
 	if *bin == "" {
 		*bin = proxy.DefaultBin
 	}
-	return proxy.Options{Port: *port, Password: *password, Bin: *bin, Aliases: cfg.ModelAliases}, nil
+	return proxy.Options{
+		Port:          *port,
+		Password:      *password,
+		Bin:           *bin,
+		Aliases:       cfg.ModelAliases,
+		Client:        *client,
+		PluginVersion: *pluginVersion,
+		EditorVersion: *editorVersion,
+		SpaceVersion:  *spaceVersion,
+	}, nil
 }
 
 func serve(opt proxy.Options) error {
@@ -93,7 +119,7 @@ func serve(opt proxy.Options) error {
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	log.Printf("codefree2api listening on http://%s bin=%s", srv.Addr(), srv.Bin())
+	log.Printf("codefree2api listening on http://%s client=%s bin=%s", srv.Addr(), srv.Client(), srv.Bin())
 	err = hs.Serve(ln)
 	_ = srv.Close()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -153,10 +179,37 @@ func runLaunch(args []string) error {
 	return cmd.Run()
 }
 
+func runLogin(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("login", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	client := fs.String("client", "", "plugin 或 space")
+	if err := fs.Parse(args); err != nil || len(fs.Args()) != 0 {
+		return errLoginUsage
+	}
+	var app srd.App
+	switch strings.ToLower(strings.TrimSpace(*client)) {
+	case "plugin":
+		app = srd.Plugin()
+	case "space":
+		app = srd.Space()
+	default:
+		return errLoginUsage
+	}
+	sess, err := srd.Login(ctx, srd.LoginOptions{App: app, Stderr: os.Stderr})
+	if err != nil {
+		return err
+	}
+	if err := srd.SaveOwn(app.Kind, sess); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, "已登录")
+	return nil
+}
+
 func parseLaunch(args []string) (tool, model string, extra []string, opt proxy.Options, err error) {
 	configPath := "config.json"
 	var port int
-	var password, bin string
+	var password, bin, client, pluginVersion, editorVersion, spaceVersion string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
@@ -185,6 +238,14 @@ func parseLaunch(args []string) (tool, model string, extra []string, opt proxy.O
 			bin, err = need()
 		case "--config", "-config":
 			configPath, err = need()
+		case "--client", "-client":
+			client, err = need()
+		case "--plugin-version", "-plugin-version":
+			pluginVersion, err = need()
+		case "--editor-version", "-editor-version":
+			editorVersion, err = need()
+		case "--space-version", "-space-version":
+			spaceVersion, err = need()
 		default:
 			if strings.HasPrefix(a, "-") {
 				return "", "", nil, proxy.Options{}, fmt.Errorf("unknown flag %s", a)
@@ -215,6 +276,15 @@ func parseLaunch(args []string) (tool, model string, extra []string, opt proxy.O
 	if bin == "" {
 		bin = cfg.Bin
 	}
-	opt = proxy.Options{Port: port, Password: password, Bin: bin, Aliases: cfg.ModelAliases}
+	opt = proxy.Options{
+		Port:          port,
+		Password:      password,
+		Bin:           bin,
+		Aliases:       cfg.ModelAliases,
+		Client:        client,
+		PluginVersion: pluginVersion,
+		EditorVersion: editorVersion,
+		SpaceVersion:  spaceVersion,
+	}
 	return tool, model, extra, opt, nil
 }

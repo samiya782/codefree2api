@@ -162,11 +162,24 @@ func (c *Codefree) runSync(ctx context.Context, req RunRequest) (RunResult, erro
 	if err != nil {
 		return RunResult{}, err
 	}
+	path := "/session/" + url.PathEscape(sid) + "/message"
 	var resp assistantPayload
-	if err := c.do(ctx, http.MethodPost, "/session/"+url.PathEscape(sid)+"/message", c.dirQuery(), promptBody(req), &resp); err != nil {
+	if err := c.do(ctx, http.MethodPost, path, c.dirQuery(), promptBody(req), &resp); err != nil {
 		return RunResult{}, err
 	}
-	res := resp.toResult(sid, req.ClientTools)
+	res := resp.toResult(sid, req.ClientTools, req.Tools)
+	if req.ClientTools && len(res.Tools) == 0 && incompleteNativeToolCall(res.Text, req.Tools) {
+		req.Prompt += "\n\nReturn the complete tool request as a JSON object with its exact name and all required arguments."
+		var retry assistantPayload
+		if err := c.do(ctx, http.MethodPost, path, c.dirQuery(), promptBody(req), &retry); err == nil {
+			recovered := retry.toResult(sid, true, req.Tools)
+			res.Usage = res.Usage.add(recovered.Usage)
+			if len(recovered.Tools) > 0 {
+				recovered.Usage = res.Usage
+				res = recovered
+			}
+		}
+	}
 	return res, res.fail()
 }
 
@@ -325,8 +338,9 @@ func promptBody(req RunRequest) map[string]any {
 	if req.Variant != "" {
 		body["variant"] = req.Variant
 	}
-	if req.ClientTools && req.Schema != nil {
-		body["format"] = map[string]any{"type": "json_schema", "schema": req.Schema}
+	if req.ClientTools {
+		// Use the built-in agent without the default unrestricted agent's own tool instructions.
+		body["agent"] = "build"
 	}
 	return body
 }
@@ -390,8 +404,9 @@ type cfPart struct {
 	State  json.RawMessage `json:"state"`
 }
 
-func (p assistantPayload) toResult(sid string, clientTools bool) RunResult {
+func (p assistantPayload) toResult(sid string, clientTools bool, tools []ToolDef) RunResult {
 	acc := newAccumulator(sid)
+	acc.tools = tools
 	acc.applyPayload(p, clientTools)
 	return acc.result()
 }
@@ -416,6 +431,7 @@ type accumulator struct {
 	structured       json.RawMessage
 	completed        bool
 	clientTools      bool
+	tools            []ToolDef
 }
 
 func newAccumulator(sid string) *accumulator {
@@ -580,7 +596,7 @@ func (a *accumulator) result() RunResult {
 	var tools []ToolCall
 	finish := a.finish
 	if a.clientTools {
-		if content, calls, ok := parseToolEnvelope(a.structured, text); ok {
+		if content, calls, ok := parseToolEnvelope(a.structured, text, a.tools); ok {
 			text = content
 			tools = calls
 			if len(calls) > 0 && (finish == "" || finish == "stop") {

@@ -24,6 +24,8 @@ type ToolDef struct {
 	Name        string
 	Description string
 	Parameters  json.RawMessage
+	Namespace   string // Name is qualified for the model when Namespace is set.
+	Custom      bool
 }
 
 // ToolChoice.Mode is auto, none, required, or tool.
@@ -56,6 +58,13 @@ func (u Usage) Completion() int { return u.Output + u.Reasoning }
 
 func (u Usage) Total() int { return u.Input + u.Completion() }
 
+func (u Usage) add(v Usage) Usage {
+	return Usage{
+		Input: u.Input + v.Input, Output: u.Output + v.Output, Reasoning: u.Reasoning + v.Reasoning,
+		CacheRead: u.CacheRead + v.CacheRead, CacheWrite: u.CacheWrite + v.CacheWrite,
+	}
+}
+
 // Delta is a streamed piece of visible text or reasoning.
 type Delta struct {
 	Text      string
@@ -70,7 +79,6 @@ type RunRequest struct {
 	Files       []FileRef
 	Variant     string
 	ClientTools bool
-	Schema      map[string]any
 	SessionID   string
 	Tools       []ToolDef
 	ToolChoice  ToolChoice

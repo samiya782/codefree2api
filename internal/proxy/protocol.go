@@ -428,7 +428,7 @@ func textAndFiles(raw json.RawMessage, files *[]FileRef) string {
 			b.WriteString(args)
 		case "tool_result":
 			id, _ := p["tool_use_id"].(string)
-			body := flattenToolResult(p["content"])
+			body := flattenToolResult(p["content"], files)
 			if b.Len() > 0 {
 				b.WriteString("\n")
 			}
@@ -441,19 +441,24 @@ func textAndFiles(raw json.RawMessage, files *[]FileRef) string {
 	return b.String()
 }
 
-func flattenToolResult(v any) string {
+func flattenToolResult(v any, files *[]FileRef) string {
 	switch t := v.(type) {
 	case string:
 		return t
 	case nil:
 		return ""
+	case map[string]any:
+		if content, ok := t["content"]; ok {
+			return flattenToolResult(content, files)
+		}
+		buf, _ := json.Marshal(t)
+		return string(buf)
 	default:
 		buf, err := json.Marshal(t)
 		if err != nil {
 			return ""
 		}
-		var files []FileRef
-		return textAndFiles(buf, &files)
+		return textAndFiles(buf, files)
 	}
 }
 
@@ -567,13 +572,21 @@ func responsesTranscript(raw json.RawMessage) (string, []FileRef, error) {
 		case "input_text":
 			text, _ := item["text"].(string)
 			write("user", text)
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			name, _ := item["name"].(string)
-			args, _ := item["arguments"].(string)
-			write("assistant", "tool_call "+name+" "+args)
-		case "function_call_output":
+			namespace, _ := item["namespace"].(string)
 			id, _ := item["call_id"].(string)
-			out := fmt.Sprint(item["output"])
+			args, _ := item["arguments"].(string)
+			if typ == "custom_tool_call" {
+				args, _ = item["input"].(string)
+			}
+			if id != "" {
+				id = " id=" + id
+			}
+			write("assistant", "tool_call "+qualifiedToolName(namespace, name)+id+" "+args)
+		case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+			id, _ := item["call_id"].(string)
+			out := flattenToolResult(item["output"], &files)
 			write("tool", strings.TrimSpace(id+": "+out))
 		case "input_image", "input_file":
 			if f, ok := fileFromPart(item); ok {
@@ -601,16 +614,64 @@ func parseToolDefs(raws []json.RawMessage, anthropic bool) ([]ToolDef, error) {
 			return nil, badRequest("tools", "invalid tool definition")
 		}
 		typ, _ := m["type"].(string)
-		if !anthropic && typ != "" && typ != "function" {
+		if !anthropic && typ == "namespace" {
+			ns, _ := m["name"].(string)
+			if subs, ok := m["tools"].([]any); ok && ns != "" {
+				for _, sub := range subs {
+					sm, _ := sub.(map[string]any)
+					if sm == nil {
+						continue
+					}
+					st, _ := sm["type"].(string)
+					if st != "" && st != "function" && st != "custom" {
+						continue
+					}
+					tool := toolDefinition(sm, false, ns, st == "custom")
+					if tool.Name == "" {
+						continue
+					}
+					out = append(out, tool)
+				}
+			}
 			continue
 		}
-		name, desc, params := toolFields(m, anthropic)
-		if name == "" {
+		if !anthropic && typ != "" && typ != "function" && typ != "custom" {
+			continue
+		}
+		tool := toolDefinition(m, anthropic, "", !anthropic && typ == "custom")
+		if tool.Name == "" {
 			return nil, badRequest("tools", "tool name is required")
 		}
-		out = append(out, ToolDef{Name: name, Description: desc, Parameters: params})
+		out = append(out, tool)
 	}
 	return out, nil
+}
+
+func toolDefinition(m map[string]any, anthropic bool, namespace string, custom bool) ToolDef {
+	name, desc, params := toolFields(m, anthropic)
+	if name == "" {
+		return ToolDef{}
+	}
+	if custom {
+		// The model uses the same object envelope for both tool types.
+		params = json.RawMessage(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`)
+		if format, ok := m["format"].(map[string]any); ok && format["type"] == "grammar" {
+			if grammar, ok := format["definition"].(string); ok {
+				desc = strings.TrimSpace(desc + "\nInput grammar:\n" + grammar)
+			}
+		}
+	}
+	return ToolDef{
+		Name: qualifiedToolName(namespace, name), Description: desc, Parameters: params,
+		Namespace: namespace, Custom: custom,
+	}
+}
+
+func qualifiedToolName(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	return namespace + "." + name
 }
 
 func toolFields(m map[string]any, anthropic bool) (name, desc string, params json.RawMessage) {
@@ -653,9 +714,10 @@ func parseToolChoice(raw json.RawMessage) (ToolChoice, error) {
 		}
 	}
 	var obj struct {
-		Type     string `json:"type"`
-		Name     string `json:"name"`
-		Function *struct {
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+		Function  *struct {
 			Name string `json:"name"`
 		} `json:"function"`
 	}
@@ -669,7 +731,7 @@ func parseToolChoice(raw json.RawMessage) (ToolChoice, error) {
 		return ToolChoice{Mode: "none"}, nil
 	case "required", "any":
 		return ToolChoice{Mode: "required"}, nil
-	case "function", "tool":
+	case "function", "tool", "custom":
 		name := obj.Name
 		if obj.Function != nil && obj.Function.Name != "" {
 			name = obj.Function.Name
@@ -677,7 +739,7 @@ func parseToolChoice(raw json.RawMessage) (ToolChoice, error) {
 		if name == "" {
 			return ToolChoice{}, badRequest("tool_choice", "tool_choice name is required")
 		}
-		return ToolChoice{Mode: "tool", Name: name}, nil
+		return ToolChoice{Mode: "tool", Name: qualifiedToolName(obj.Namespace, name)}, nil
 	default:
 		return ToolChoice{}, badRequest("tool_choice", "unsupported tool_choice")
 	}
@@ -712,51 +774,25 @@ func parseAnthropicToolChoice(raw json.RawMessage) (ToolChoice, error) {
 	}
 }
 
-func toolSchema(tools []ToolDef, choice ToolChoice) map[string]any {
-	if len(tools) == 0 || choice.Mode == "none" {
-		return nil
-	}
-	nameSchema := map[string]any{"type": "string"}
-	if choice.Mode == "tool" && choice.Name != "" {
-		nameSchema["enum"] = []string{choice.Name}
-	}
-	items := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"properties": map[string]any{
-			"name":      nameSchema,
-			"arguments": map[string]any{"type": "object"},
-		},
-		"required": []string{"name", "arguments"},
-	}
-	calls := map[string]any{"type": "array", "items": items}
-	if choice.Mode == "required" || choice.Mode == "tool" {
-		calls["minItems"] = 1
-	}
-	return map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"properties": map[string]any{
-			"content":    map[string]any{"type": "string"},
-			"tool_calls": calls,
-		},
-		"required": []string{"content", "tool_calls"},
-	}
-}
-
 func withToolInstructions(system string, tools []ToolDef, choice ToolChoice) string {
 	var b strings.Builder
 	if strings.TrimSpace(system) != "" {
 		b.WriteString(strings.TrimSpace(system))
 		b.WriteString("\n\n")
 	}
-	b.WriteString("You are answering through an API. Do not use local tools or touch the filesystem. ")
-	b.WriteString("Respond as JSON with keys content (string) and tool_calls (array of {name, arguments}). ")
+	b.WriteString("You are answering through an API and you cannot execute anything yourself. ")
+	b.WriteString(`Respond with a single JSON object of the form {"content": string, "tool_calls": [{"name": string, "arguments": object}]}. `)
+	b.WriteString("To use a tool, put its name and arguments in tool_calls; nothing else happens. ")
 	if choice.Mode == "required" || choice.Mode == "tool" {
-		b.WriteString("You must call a tool. ")
+		b.WriteString("You must call a tool: tool_calls must contain at least one entry. ")
+		if choice.Mode == "tool" {
+			fmt.Fprintf(&b, "Use only the tool named %q. ", choice.Name)
+		}
 	} else {
 		b.WriteString("If no tool is needed, use an empty tool_calls array and put the answer in content. ")
 	}
+	b.WriteString("Use only this JSON format, with no markup, no command transcripts, and no invented tool results. ")
+	b.WriteString("A tool's output can only reach you in a later turn. ")
 	b.WriteString("Available tools:\n")
 	for _, t := range tools {
 		b.WriteString("- ")
@@ -767,7 +803,7 @@ func withToolInstructions(system string, tools []ToolDef, choice ToolChoice) str
 		}
 		if len(bytesTrimSpace(t.Parameters)) > 0 {
 			b.WriteString(" parameters=")
-			b.Write(t.Parameters)
+			b.Write(stripSchemaDesc(t.Parameters))
 		}
 		b.WriteString("\n")
 	}
@@ -798,19 +834,54 @@ type toolEnvelope struct {
 	} `json:"tool_calls"`
 }
 
-func parseToolEnvelope(structured json.RawMessage, text string) (string, []ToolCall, bool) {
-	if env, ok := decodeEnvelope(structured); ok {
-		return env.Content, envelopeCalls(env), true
-	}
-	if env, ok := decodeEnvelope(json.RawMessage(strings.TrimSpace(text))); ok {
-		return env.Content, envelopeCalls(env), true
-	}
-	if fence := fencedJSON(text); fence != "" {
-		if env, ok := decodeEnvelope(json.RawMessage(fence)); ok {
-			return env.Content, envelopeCalls(env), true
+func parseToolEnvelope(structured json.RawMessage, text string, tools []ToolDef) (string, []ToolCall, bool) {
+	known := knownToolNames(tools)
+	var fallback *toolEnvelope
+	candidates := []json.RawMessage{structured, json.RawMessage(text), json.RawMessage(fencedJSON(text))}
+	for _, candidate := range candidates {
+		if env, ok := decodeEnvelope(candidate); ok {
+			if calls := envelopeCalls(env, known); len(calls) > 0 {
+				return env.Content, calls, true
+			}
+			if content, calls, ok := parseNativeToolCalls(env.Content, known); ok {
+				return content, calls, true
+			}
+			if fallback == nil {
+				fallback = &env
+			}
 		}
 	}
+	if prefix, env, ok := trailingToolEnvelope(text); ok {
+		if calls := envelopeCalls(env, known); len(calls) > 0 {
+			content := strings.TrimSpace(env.Content)
+			if content == "" {
+				content = strings.TrimSpace(prefix)
+			}
+			return content, calls, true
+		}
+	}
+	if content, calls, ok := parseNativeToolCalls(text, known); ok {
+		return content, calls, true
+	}
+	if fallback != nil {
+		return fallback.Content, nil, true
+	}
 	return text, nil, false
+}
+
+func trailingToolEnvelope(text string) (string, toolEnvelope, bool) {
+	end := strings.LastIndex(text, `"tool_calls"`)
+	for end > 0 {
+		start := strings.LastIndexByte(text[:end], '{')
+		if start < 0 {
+			break
+		}
+		if env, ok := decodeEnvelope(json.RawMessage(text[start:])); ok && len(env.ToolCalls) > 0 {
+			return text[:start], env, true
+		}
+		end = start
+	}
+	return "", toolEnvelope{}, false
 }
 
 func decodeEnvelope(raw json.RawMessage) (toolEnvelope, bool) {
@@ -834,15 +905,19 @@ func decodeEnvelope(raw json.RawMessage) (toolEnvelope, bool) {
 	return env, true
 }
 
-func envelopeCalls(env toolEnvelope) []ToolCall {
+func envelopeCalls(env toolEnvelope, known map[string]string) []ToolCall {
 	var out []ToolCall
 	for _, c := range env.ToolCalls {
-		if strings.TrimSpace(c.Name) == "" {
+		name := strings.TrimSpace(c.Name)
+		if name == "" {
 			continue
+		}
+		if canonical, ok := canonicalToolName(name, known); ok {
+			name = canonical
 		}
 		out = append(out, ToolCall{
 			ID:        newID("call"),
-			Name:      c.Name,
+			Name:      name,
 			Arguments: argsString(c.Arguments),
 		})
 	}
@@ -899,4 +974,735 @@ func countTurnTokens(turn Turn) int {
 		n = 1
 	}
 	return n
+}
+
+func knownToolNames(tools []ToolDef) map[string]string {
+	if len(tools) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(tools)*2)
+	add := func(alias, canonical string) {
+		if alias == "" {
+			return
+		}
+		if _, ok := m[alias]; !ok {
+			m[alias] = canonical
+		}
+	}
+	for _, t := range tools {
+		add(t.Name, t.Name)
+		if i := strings.LastIndexByte(t.Name, '.'); i > 0 && i < len(t.Name)-1 {
+			add(t.Name[i+1:], t.Name)
+		}
+	}
+	return m
+}
+
+func canonicalToolName(name string, known map[string]string) (string, bool) {
+	for {
+		if canonical, ok := known[name]; ok {
+			return canonical, true
+		}
+		i := strings.IndexByte(name, '.')
+		if i < 0 || i >= len(name)-1 {
+			return "", false
+		}
+		name = name[i+1:]
+	}
+}
+
+func genericToolMark(name string) bool {
+	switch name {
+	case "tool_call", "tool_calls", "tool-call", "TOOL_CALLS", "ToolCalls", "tool", "function-call", "function_call", "functioncall":
+		return true
+	}
+	return false
+}
+
+// parseNativeToolCalls recovers tool calls when a model emits its native
+// tool-call markup (e.g. "<tool_name>args</tool_name>", "<tool_call>{json}",
+// "⟨tool_name⟩arg_key/arg_value blocks") instead of the requested JSON
+// envelope. known maps every acceptable name (full and short) to the
+// canonical ToolDef.Name.
+func parseNativeToolCalls(text string, known map[string]string) (string, []ToolCall, bool) {
+	if len(known) == 0 || !strings.ContainsAny(text, "<⟨") {
+		return "", nil, false
+	}
+	// Angle brackets are a strong signal of the model's native tool-call
+	// template; under that signal accept unknown tool names too and let the
+	// caller report them so the model can self-correct on the next turn.
+	relaxed := strings.Contains(text, "⟨")
+	text = strings.ReplaceAll(text, "⟨", "<")
+	text = strings.ReplaceAll(text, "⟩", ">")
+	var calls []ToolCall
+	var keep []string
+	pos := 0
+	for pos < len(text) {
+		rel := strings.IndexByte(text[pos:], '<')
+		if rel < 0 {
+			keep = append(keep, text[pos:])
+			break
+		}
+		start := pos + rel
+		name, after, ok := readNativeMarker(text, start)
+		if !ok {
+			keep = append(keep, text[pos:start+1])
+			pos = start + 1
+			continue
+		}
+		end, next := findNativeCallEnd(text, after, known)
+		if genericToolMark(name) {
+			if call, n, ok := parseNamedNativeCall(text[after:], known); ok {
+				keep = append(keep, text[pos:start])
+				calls = append(calls, call)
+				pos = after + n
+				continue
+			}
+			if got := parseGenericToolCalls(text[after:end], known); len(got) > 0 {
+				keep = append(keep, text[pos:start])
+				calls = append(calls, got...)
+				pos = next
+				continue
+			}
+		} else {
+			canonical, knownName := canonicalToolName(name, known)
+			if !knownName {
+				if prefix, ok := longestKnownPrefix(name, known); ok {
+					canonical, knownName = prefix, true
+				}
+			}
+			if !knownName && relaxed && looksLikeToolName(name) {
+				canonical, knownName = name, true
+			}
+			if knownName {
+				if after < len(text) && (isSpaceByte(text[after]) || xmlAttrAhead(text, after)) {
+					if args, next, ok := parseXMLCall(text, after); ok {
+						keep = append(keep, text[pos:start])
+						calls = append(calls, ToolCall{
+							ID:        newID("call"),
+							Name:      canonical,
+							Arguments: string(args),
+						})
+						pos = next
+						continue
+					}
+				}
+				if args, ok := parseNativeArgs(text[after:end]); ok {
+					keep = append(keep, text[pos:start])
+					calls = append(calls, ToolCall{
+						ID:        newID("call"),
+						Name:      canonical,
+						Arguments: string(args),
+					})
+					pos = next
+					continue
+				}
+			}
+		}
+		if len(calls) > 0 && end == len(text) {
+			keep = append(keep, text[pos:start])
+			pos = next
+			continue
+		}
+		keep = append(keep, text[pos:after])
+		pos = after
+	}
+	if len(calls) == 0 {
+		return "", nil, false
+	}
+	content := strings.TrimSpace(strings.Join(keep, ""))
+	return content, calls, true
+}
+
+// Some models spell the name directly after <tool_call>, followed by a JSON
+// object in parentheses or by XML argument pairs.
+func parseNamedNativeCall(s string, known map[string]string) (ToolCall, int, bool) {
+	rawName, rest := splitNativeToolName(s)
+	name, ok := canonicalToolName(rawName, known)
+	if !ok {
+		return ToolCall{}, 0, false
+	}
+	rest = strings.TrimLeft(rest, " \t\r\n")
+	var args json.RawMessage
+	if value, ok := strings.CutPrefix(rest, "("); ok {
+		value = strings.TrimLeft(value, " \t\r\n")
+		value, _ = strings.CutPrefix(value, "arguments=")
+		dec := json.NewDecoder(strings.NewReader(value))
+		if err := dec.Decode(&args); err != nil || args[0] != '{' {
+			return ToolCall{}, 0, false
+		}
+		rest, ok = strings.CutPrefix(strings.TrimLeft(value[dec.InputOffset():], " \t\r\n"), ")")
+		if !ok {
+			return ToolCall{}, 0, false
+		}
+	} else {
+		var ok bool
+		args, rest, ok = parseXMLArgumentPairs(rest)
+		if !ok {
+			return ToolCall{}, 0, false
+		}
+	}
+	closing := strings.TrimLeft(rest, " \t\r\n")
+	for _, tag := range []string{"</tool_call>", "</function_call>", "}"} {
+		if tail, ok := strings.CutPrefix(closing, tag); ok {
+			rest = tail
+			break
+		}
+	}
+	return ToolCall{ID: newID("call"), Name: name, Arguments: string(args)}, len(s) - len(rest), true
+}
+
+func splitNativeToolName(s string) (string, string) {
+	s = strings.TrimLeft(s, " \t\r\n")
+	i := 0
+	for i < len(s) && (isIdentChar(s[i]) || s[i] == '.') {
+		i++
+	}
+	return s[:i], s[i:]
+}
+
+func incompleteNativeToolCall(text string, tools []ToolDef) bool {
+	const marker = "<tool_call>"
+	i := strings.LastIndex(text, marker)
+	if i < 0 {
+		return false
+	}
+	name, tail := splitNativeToolName(text[i+len(marker):])
+	if strings.Contains(tail, "</tool_call>") {
+		return false
+	}
+	_, ok := canonicalToolName(name, knownToolNames(tools))
+	return ok
+}
+
+func parseXMLArgumentPairs(s string) (json.RawMessage, string, bool) {
+	args := map[string]any{}
+	for {
+		pair, ok := strings.CutPrefix(strings.TrimLeft(s, " \t\r\n"), "<arg_key>")
+		if !ok {
+			break
+		}
+		key, value, ok := strings.Cut(pair, "</arg_key>")
+		if !ok || strings.TrimSpace(key) == "" {
+			return nil, s, false
+		}
+		value = strings.TrimLeft(value, " \t\r\n")
+		value, _ = strings.CutPrefix(value, "<arg_value>")
+		value, tail, ok := strings.Cut(value, "</arg_value>")
+		if !ok {
+			return nil, s, false
+		}
+		args[strings.TrimSpace(key)] = nativeValue(xmlUnescape(value))
+		s = tail
+	}
+	if len(args) == 0 {
+		return nil, s, false
+	}
+	data, ok := marshalObj(args)
+	return data, s, ok
+}
+
+func readNativeMarker(text string, start int) (string, int, bool) {
+	i := start + 1
+	if i < len(text) && text[i] == '=' {
+		i++
+	}
+	nameStart := i
+	for i < len(text) {
+		c := text[i]
+		switch c {
+		case '>', '<':
+			if c == '<' {
+				return "", 0, false
+			}
+			name := strings.TrimSpace(text[nameStart:i])
+			if name == "" {
+				return "", 0, false
+			}
+			return name, i + 1, true
+		case ' ', '\t', '\n', '\r':
+			name := strings.TrimSpace(text[nameStart:i])
+			if name == "" {
+				return "", 0, false
+			}
+			return name, i, true
+		}
+		i++
+	}
+	return "", 0, false
+}
+
+func findNativeCallEnd(text string, from int, known map[string]string) (int, int) {
+	for i := from; i < len(text); i++ {
+		if text[i] != '<' {
+			continue
+		}
+		if strings.HasPrefix(text[i:], "</") {
+			if j := strings.IndexByte(text[i:], '>'); j >= 0 {
+				return i, i + j + 1
+			}
+			return len(text), len(text)
+		}
+		if name, _, ok := readNativeMarker(text, i); ok {
+			if _, knownName := canonicalToolName(name, known); knownName || genericToolMark(name) {
+				return i, i
+			}
+		}
+	}
+	return len(text), len(text)
+}
+
+func parseNativeArgs(s string) (json.RawMessage, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return json.RawMessage("{}"), true
+	}
+	if strings.HasPrefix(s, "{") && json.Valid([]byte(s)) {
+		return json.RawMessage(s), true
+	}
+	obj := map[string]any{}
+	if parseArgKeyValues(s, obj) {
+		return marshalObj(obj)
+	}
+	if parseColonLines(s, obj) > 0 {
+		return marshalObj(obj)
+	}
+	if parseSpaceLines(s, obj) > 0 {
+		return marshalObj(obj)
+	}
+	return nil, false
+}
+
+// parseXMLCall scans an XML-attribute style argument list (name is already
+// consumed; text[from] is the first byte after it, expected whitespace).
+// It is quote-aware so attribute values may contain <, > or newlines.
+// Returns the arguments object and the offset just past the call.
+func parseXMLCall(text string, from int) (json.RawMessage, int, bool) {
+	obj := map[string]any{}
+	i := from
+	sawArg := false
+	for i < len(text) {
+		c := text[i]
+		if isSpaceByte(c) {
+			i++
+			continue
+		}
+		if c == '/' {
+			if i+1 < len(text) && text[i+1] == '>' {
+				if !sawArg {
+					return nil, 0, false
+				}
+				raw, ok := marshalObj(obj)
+				if !ok {
+					return nil, 0, false
+				}
+				return raw, i + 2, true
+			}
+			i++
+			continue
+		}
+		if c == '>' {
+			if !sawArg {
+				return nil, 0, false
+			}
+			raw, ok := marshalObj(obj)
+			if !ok {
+				return nil, 0, false
+			}
+			return raw, i + 1, true
+		}
+		if !isIdentStart(c) {
+			i++
+			continue
+		}
+		ks := i
+		for i < len(text) && isIdentChar(text[i]) {
+			i++
+		}
+		key := text[ks:i]
+		for i < len(text) && isSpaceByte(text[i]) {
+			i++
+		}
+		if i >= len(text) || text[i] != '=' {
+			continue
+		}
+		i++
+		for i < len(text) && isSpaceByte(text[i]) {
+			i++
+		}
+		if i >= len(text) {
+			obj[key] = ""
+			sawArg = true
+			break
+		}
+		q := text[i]
+		if q == '"' || q == '\'' {
+			i++
+			vs := i
+			for i < len(text) && text[i] != q {
+				i++
+			}
+			if i >= len(text) {
+				obj[key] = nativeValue(xmlUnescape(text[vs:]))
+				sawArg = true
+				break
+			}
+			obj[key] = nativeValue(xmlUnescape(text[vs:i]))
+			sawArg = true
+			i++
+			continue
+		}
+		vs := i
+		for i < len(text) && !isSpaceByte(text[i]) && text[i] != '>' {
+			i++
+		}
+		obj[key] = nativeValue(xmlUnescape(text[vs:i]))
+		sawArg = true
+	}
+	if !sawArg {
+		return nil, 0, false
+	}
+	raw, ok := marshalObj(obj)
+	if !ok {
+		return nil, 0, false
+	}
+	return raw, i, true
+}
+
+func xmlUnescape(s string) string {
+	if !strings.Contains(s, "&") && !strings.Contains(s, `\`) {
+		return s
+	}
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	s = strings.ReplaceAll(s, "&apos;", "'")
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	s = strings.ReplaceAll(s, `\'`, `'`)
+	return s
+}
+
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// xmlAttrAhead reports whether the bytes at from look like the start of an
+// XML-attribute list: identifier followed by '='.
+func xmlAttrAhead(text string, from int) bool {
+	i := from
+	for i < len(text) && isSpaceByte(text[i]) {
+		i++
+	}
+	if i >= len(text) || !isIdentStart(text[i]) {
+		return false
+	}
+	for i < len(text) && isIdentChar(text[i]) {
+		i++
+	}
+	for i < len(text) && isSpaceByte(text[i]) {
+		i++
+	}
+	return i < len(text) && text[i] == '='
+}
+
+func isIdentStart(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isIdentChar(c byte) bool {
+	return isIdentStart(c) || (c >= '0' && c <= '9') || c == '-'
+}
+
+func parseArgKeyValues(s string, obj map[string]any) bool {
+	lines := strings.Split(s, "\n")
+	found := false
+	i := 0
+	for i < len(lines) {
+		if strings.TrimSpace(lines[i]) != "arg_key" {
+			i++
+			continue
+		}
+		i++
+		if i >= len(lines) {
+			break
+		}
+		key := strings.TrimSpace(lines[i])
+		i++
+		if i < len(lines) && strings.TrimSpace(lines[i]) == "arg_value" {
+			i++
+		}
+		var vals []string
+		for i < len(lines) && strings.TrimSpace(lines[i]) != "arg_key" {
+			vals = append(vals, lines[i])
+			i++
+		}
+		val := strings.TrimSpace(strings.Join(vals, "\n"))
+		if key != "" && val != "" {
+			obj[key] = nativeValue(val)
+			found = true
+		}
+	}
+	return found
+}
+
+func parseColonLines(s string, obj map[string]any) int {
+	n := 0
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		i := strings.IndexByte(ln, ':')
+		if i <= 0 || i == len(ln)-1 {
+			continue
+		}
+		key := strings.TrimSpace(ln[:i])
+		val := strings.TrimSpace(ln[i+1:])
+		if !isIdent(key) || val == "" {
+			continue
+		}
+		obj[key] = nativeValue(val)
+		n++
+	}
+	return n
+}
+
+func parseGenericToolCalls(s string, known map[string]string) []ToolCall {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var items []map[string]json.RawMessage
+	if strings.HasPrefix(s, "[") {
+		var arr []map[string]json.RawMessage
+		if json.Unmarshal([]byte(s), &arr) == nil {
+			items = arr
+		}
+	} else if strings.HasPrefix(s, "{") && json.Valid([]byte(s)) {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal([]byte(s), &obj) == nil {
+			items = append(items, obj)
+		}
+	} else {
+		items = parseNameArgumentLines(s)
+	}
+	var out []ToolCall
+	for _, item := range items {
+		nameRaw, ok := item["name"]
+		if !ok {
+			continue
+		}
+		var name string
+		if json.Unmarshal(nameRaw, &name) != nil || name == "" {
+			continue
+		}
+		canonical, knownName := canonicalToolName(name, known)
+		if !knownName {
+			continue
+		}
+		args := "{}"
+		if raw, ok := item["arguments"]; ok {
+			var v any
+			if json.Unmarshal(raw, &v) == nil {
+				b, _ := json.Marshal(v)
+				args = string(b)
+			}
+		} else if len(item) > 1 {
+			flat := map[string]json.RawMessage{}
+			for k, v := range item {
+				if k != "name" {
+					flat[k] = v
+				}
+			}
+			if len(flat) > 0 {
+				b, _ := json.Marshal(flat)
+				args = string(b)
+			}
+		}
+		out = append(out, ToolCall{ID: newID("call"), Name: canonical, Arguments: args})
+	}
+	return out
+}
+
+func parseNameArgumentLines(s string) []map[string]json.RawMessage {
+	lines := strings.Split(s, "\n")
+	var out []map[string]json.RawMessage
+	var cur map[string]json.RawMessage
+	flush := func() {
+		if cur != nil {
+			out = append(out, cur)
+			cur = nil
+		}
+	}
+	for i := 0; i < len(lines); i++ {
+		key := strings.TrimSpace(lines[i])
+		if key == "name" && i+1 < len(lines) {
+			flush()
+			cur = map[string]json.RawMessage{"name": json.RawMessage(quotedString(strings.TrimSpace(lines[i+1])))}
+			i++
+			continue
+		}
+		if key == "arguments" && cur != nil {
+			var rest []string
+			for j := i + 1; j < len(lines); j++ {
+				if strings.TrimSpace(lines[j]) == "name" {
+					break
+				}
+				rest = append(rest, lines[j])
+			}
+			raw := strings.TrimSpace(strings.Join(rest, "\n"))
+			if raw != "" && json.Valid([]byte(raw)) {
+				cur["arguments"] = json.RawMessage(raw)
+			}
+			flush()
+			i += len(rest)
+		}
+	}
+	flush()
+	return out
+}
+
+func nativeValue(v string) any {
+	t := strings.TrimSpace(v)
+	if json.Valid([]byte(t)) {
+		var out any
+		if err := json.Unmarshal([]byte(t), &out); err == nil {
+			return out
+		}
+	}
+	return t
+}
+
+func marshalObj(obj map[string]any) (json.RawMessage, bool) {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+func isIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_' || c == '-':
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func quotedString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func looksLikeToolName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c == '_':
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// parseSpaceLines parses "key value" lines (space-separated, no colon) as a
+// last-resort fallback inside a native call block.
+func parseSpaceLines(s string, obj map[string]any) int {
+	n := 0
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		i := strings.IndexByte(ln, ' ')
+		if i <= 0 {
+			continue
+		}
+		key := ln[:i]
+		val := strings.TrimSpace(ln[i+1:])
+		if !isIdent(key) || val == "" {
+			continue
+		}
+		if _, exists := obj[key]; exists {
+			continue
+		}
+		obj[key] = nativeValue(val)
+		n++
+	}
+	return n
+}
+
+// stripSchemaDesc drops "description" fields from a JSON schema before it is
+// inlined into the system prompt: parameter names are self-descriptive and
+// descriptions dominate the token budget for large tool sets.
+func stripSchemaDesc(raw json.RawMessage) json.RawMessage {
+	if len(bytesTrimSpace(raw)) == 0 {
+		return raw
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return raw
+	}
+	b, err := json.Marshal(stripDescValue(v))
+	if err != nil {
+		return raw
+	}
+	return b
+}
+
+func stripDescValue(o any) any {
+	switch v := o.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			if k == "description" {
+				continue
+			}
+			out[k] = stripDescValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i, val := range v {
+			out[i] = stripDescValue(val)
+		}
+		return out
+	default:
+		return o
+	}
+}
+
+// longestKnownPrefix matches names like "exec_commandadditionalProperties:"
+// where the model concatenated a known tool name with schema noise. The
+// remainder must start with an identifier character (true concatenation).
+func longestKnownPrefix(name string, known map[string]string) (string, bool) {
+	best := ""
+	for k := range known {
+		if len(k) > len(best) && strings.HasPrefix(name, k) {
+			rest := name[len(k):]
+			if rest == "" || isIdentStart(rest[0]) {
+				best = k
+			}
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return known[best], true
 }

@@ -40,7 +40,7 @@ codefree2api -client plugin -port 8766 -editor-version 1.146.0
 | 2 | 9 | 4 | 20:39:50 退出 0 | 20:39:51 退出 0 |
 | 3 | 3 | 2 | 20:39:50 退出 0 | 20:39:51 退出 0 |
 
-时间是本地时间。命令在 Linux 上执行。按实现，CodeFree Space 的 `client.type` 是 `ide-linux`，插件是 `vscode`。这次没有另存请求正文。
+时间是本地时间。命令在 Linux 上执行。当时的实现把 CodeFree Space 的 `client.type` 写成 `ide-linux`，插件是 `vscode`。当前 Space 行数改为固定 `ide-win32`，见 ADR 0013。这次没有另存请求正文。
 
 上报之后用同一条远端再查了一次项目和版本，都是 HTTP 200：
 

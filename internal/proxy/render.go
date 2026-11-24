@@ -1,6 +1,9 @@
 package proxy
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 func openAIFinish(finish string) string {
 	switch finish {
@@ -97,37 +100,57 @@ func anthropicContent(text, reasoning string, tools []ToolCall) []map[string]any
 	return out
 }
 
-func responseOutput(text, reasoning string, tools []ToolCall) []any {
-	var out []any
-	if reasoning != "" {
-		out = append(out, map[string]any{
-			"type": "reasoning",
-			"id":   newID("rs"),
-			"summary": []map[string]any{
-				{"type": "summary_text", "text": reasoning},
-			},
-		})
+func responseOutput(res RunResult, tools []ToolDef) []map[string]any {
+	out := make([]map[string]any, 0, len(res.Tools)+2)
+	if res.Reasoning != "" {
+		out = append(out, responseReasoning(newID("rs"), res.Reasoning))
 	}
-	if text != "" || len(tools) == 0 {
-		out = append(out, map[string]any{
-			"type":   "message",
-			"id":     newID("msg"),
-			"role":   "assistant",
-			"status": "completed",
-			"content": []map[string]any{
-				{"type": "output_text", "text": text, "annotations": []any{}},
-			},
-		})
+	if res.Text != "" || len(res.Tools) == 0 {
+		out = append(out, responseMessage(newID("msg"), res.Text))
 	}
-	for _, tc := range tools {
-		out = append(out, map[string]any{
-			"type":      "function_call",
-			"id":        newID("fc"),
-			"call_id":   tc.ID,
-			"name":      tc.Name,
-			"arguments": tc.Arguments,
-			"status":    "completed",
-		})
+	for _, tc := range res.Tools {
+		item, _, _ := responseToolItem(tc, tools)
+		out = append(out, item)
 	}
 	return out
+}
+
+func responseReasoning(id, text string) map[string]any {
+	return map[string]any{
+		"type": "reasoning", "id": id,
+		"summary": []map[string]any{{"type": "summary_text", "text": text}},
+	}
+}
+
+func responseMessage(id, text string) map[string]any {
+	return map[string]any{
+		"type": "message", "id": id, "role": "assistant", "status": "completed",
+		"content": []map[string]any{{"type": "output_text", "text": text, "annotations": []any{}}},
+	}
+}
+
+func responseToolItem(call ToolCall, tools []ToolDef) (item map[string]any, argumentField, eventPrefix string) {
+	item = map[string]any{
+		"type": "function_call", "id": newID("fc"), "call_id": call.ID, "name": call.Name,
+		"arguments": call.Arguments, "status": "completed",
+	}
+	for _, tool := range tools {
+		if tool.Name != call.Name {
+			continue
+		}
+		if tool.Namespace != "" {
+			item["namespace"] = tool.Namespace
+			item["name"] = strings.TrimPrefix(call.Name, tool.Namespace+".")
+		}
+		if tool.Custom {
+			var args struct{ Input string }
+			_ = json.Unmarshal([]byte(call.Arguments), &args)
+			item["type"] = "custom_tool_call"
+			item["input"] = args.Input
+			delete(item, "arguments")
+			return item, "input", "response.custom_tool_call_input"
+		}
+		break
+	}
+	return item, "arguments", "response.function_call_arguments"
 }

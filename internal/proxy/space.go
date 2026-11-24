@@ -73,7 +73,7 @@ func (s *Space) Run(ctx context.Context, req RunRequest, emit func(Delta) error)
 		return RunResult{}, err
 	}
 	if len(res.Tools) == 0 && req.ClientTools {
-		if text, calls, ok := parseToolEnvelope(nil, res.Text); ok {
+		if text, calls, ok := parseToolEnvelope(nil, res.Text, req.Tools); ok {
 			res.Text = text
 			res.Tools = calls
 			if len(calls) > 0 {

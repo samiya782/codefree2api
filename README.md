@@ -27,7 +27,7 @@
 - `POST /v1/messages/count_tokens`
 - `POST /v1/responses`（Codex wire API），含 `previous_response_id` 续写
 - `Authorization: Bearer` 与 `x-api-key`。Bearer 写错时不会再去认 `x-api-key`
-- 工具：`tools`、`tool_choice`、`tool_use` / `tool_result`、OpenAI `tool_calls`。带工具时会话权限为拒绝助手自己执行命令，结果按 JSON 工具信封解析
+- 工具：`tools`、`tool_choice`、Anthropic `tool_use` / `tool_result`、OpenAI `tool_calls`，以及 Responses 的命名空间函数和自定义工具。用 codefree-o 代理时，会话禁止上游执行工具，代理把模型回复里的工具调用转换为客户端事件，由客户端执行并回传结果
 - 图片和文件，转成 `codefree-o` 的 file part（`data:` URL 会落成临时文件）
 - `max_tokens`（系统提示里的长度提示，再按本地估算截断）、`stop`（本地截断）
 - `reasoning_effort`、`reasoning.effort`、`output_config.effort`、Anthropic `thinking` 会映射成 variant。若上游因 variant 返回 400 且尚未输出，会去掉 variant 再试一次
@@ -236,9 +236,10 @@ codefree2api lines 8 3
 codefree2api lines --remote https://example.srdcloud.cn/group/repo 8 3
 codefree2api lines plugin 8 3
 codefree2api lines space --remote https://example.srdcloud.cn/group/repo 8 3
+codefree2api lines space spec 8 3
 ```
 
-2026-11-16 的插件与 CodeFree Space 实测见 [docs/plugin-and-space-live.md](docs/plugin-and-space-live.md)。两个整数都由用户填写，命令不读取 diff。不写 `plugin` 或 `space` 时，上报走 codefree-o。`lines plugin` 是插件行数，`lines space` 是 CodeFree Space 行数。不写 `--remote` 时，要在被记入的仓库目录里执行，上报使用这个仓库的全部远端。`--remote` 可重复，写出之后上报只带这些地址，这时可以在别的目录执行。生成代码采纳行数为 0 时不上报，也不登录。插件可以写 `--plugin-version` 和 `--editor-version`。CodeFree Space 可以写 `--space-version`。需要身份时，先用 `codefree2api login` 留下的身份，再看该客户端已经写下的登录，都没有才打开登录页。命令不设置 `SRDCLOUD_*`；codefree-o 这一路在环境里已经有完整的这一组变量时，使用那一份登录。词表和取舍见 [GLOSSARY.md](GLOSSARY.md) 与 [docs/adr/](docs/adr/)。
+2026-11-16 的插件与 CodeFree Space 实测见 [docs/plugin-and-space-live.md](docs/plugin-and-space-live.md)。两个整数都由用户填写，命令不读取 diff。不写 `plugin` 或 `space` 时，上报走 codefree-o。`lines plugin` 是插件行数，`lines space` 是 CodeFree Space 行数，`lines space spec` 是 CodeFree Space spec 行数。不写 `--remote` 时，要在被记入的仓库目录里执行，上报使用这个仓库的全部远端。`--remote` 可重复，写出之后上报只带这些地址，这时可以在别的目录执行。生成代码采纳行数为 0 时不上报，也不登录。插件可以写 `--plugin-version` 和 `--editor-version`。CodeFree Space 可以写 `--space-version`。需要身份时，先用 `codefree2api login` 留下的身份，再看该客户端已经写下的登录，都没有才打开登录页。命令不设置 `SRDCLOUD_*`；codefree-o 这一路在环境里已经有完整的这一组变量时，使用那一份登录。词表和取舍见 [GLOSSARY.md](GLOSSARY.md) 与 [docs/adr/](docs/adr/)。
 
 ## 开发
 

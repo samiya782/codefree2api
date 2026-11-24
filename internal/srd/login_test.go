@@ -3,6 +3,7 @@ package srd
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +87,43 @@ func TestLoginExchange(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatal("printed")
+	}
+}
+
+func TestLoginTokenRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != tokenPath {
+			t.Fatal("path")
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "error=bad_verification_code&error_description=secret-value")
+	}))
+	defer srv.Close()
+	_, err := Login(context.Background(), LoginOptions{
+		App:  App{Kind: KindSpace, Host: srv.URL, ClientID: "app-client"},
+		HTTP: srv.Client(),
+		Open: func(raw string) error {
+			page, err := url.Parse(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state, err := base64.StdEncoding.DecodeString(page.Query().Get("state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.Get(string(state) + "&code=abc")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			return nil
+		},
+	})
+	if !errors.Is(err, ErrLogin) {
+		t.Fatal(err)
+	}
+	if err.Error() != "登录失败（令牌交换 bad_verification_code）" || strings.Contains(err.Error(), "secret") {
+		t.Fatal(err)
 	}
 }
 

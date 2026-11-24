@@ -223,7 +223,7 @@ func TestClientToolsPassedUpstream(t *testing.T) {
 		t.Fatal(rec.Body.String())
 	}
 	got := eng.last()
-	if !got.ClientTools || got.Schema == nil {
+	if !got.ClientTools || !strings.Contains(got.System, "Available tools:") {
 		t.Fatalf("tools not enabled: %+v", got)
 	}
 	if len(got.Files) != 1 || !strings.HasPrefix(got.Files[0].URL, "file://") {
@@ -331,8 +331,8 @@ func TestCodefreeSyncAndStream(t *testing.T) {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/message"):
 			var req map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			if _, ok := req["format"]; !ok {
-				t.Errorf("expected json schema format, body %#v", req)
+			if _, ok := req["format"]; ok {
+				t.Error("client tools must not activate the upstream StructuredOutput tool")
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"info": map[string]any{
@@ -372,7 +372,6 @@ func TestCodefreeSyncAndStream(t *testing.T) {
 		ModelID:     "GLM-5.2",
 		Prompt:      "use the tool",
 		ClientTools: true,
-		Schema:      map[string]any{"type": "object"},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)

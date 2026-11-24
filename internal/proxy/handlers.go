@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -157,19 +158,19 @@ func (s *Server) finishResponses(w http.ResponseWriter, r *http.Request, turn Tu
 	s.finishTurn(w, r, "/v1/responses", false, turn, func(res RunResult) {
 		id := newID("resp")
 		s.remember(id, res.SessionID)
-		writeJSON(w, http.StatusOK, responseObject(id, turn.Model, res))
+		writeJSON(w, http.StatusOK, responseObject(id, turn.Model, res, responseOutput(res, turn.Tools)))
 	})
 }
 
 func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, turn Turn) {
 	s.streamTurn(w, r, "/v1/responses", false, turn, func(fl http.Flusher) turnSink {
 		id := newID("resp")
-		created := responseObject(id, turn.Model, RunResult{Finish: "stop"})
+		output := []map[string]any{}
+		created := responseObject(id, turn.Model, RunResult{Finish: "stop"}, output)
 		created["status"] = "in_progress"
-		created["output"] = []any{}
 		_ = WriteSSEEvent(w, "response.created", map[string]any{"type": "response.created", "response": created})
 		flush(fl)
-		return &responsesStream{w: w, fl: fl, srv: s, id: id, model: turn.Model}
+		return &responsesStream{w: w, fl: fl, srv: s, id: id, model: turn.Model, definitions: turn.Tools, output: output}
 	})
 }
 
@@ -191,7 +192,6 @@ func (s *Server) finishTurn(w http.ResponseWriter, r *http.Request, endpoint str
 type turnSink interface {
 	reasoning(string) error
 	text(string) error
-	tools([]ToolCall) error
 	finish(RunResult) error
 	fail(error)
 }
@@ -267,7 +267,6 @@ func (s *Server) streamTurn(w http.ResponseWriter, r *http.Request, endpoint str
 			res.StopMatch = lim.matched
 		}
 	}
-	_ = sink.tools(res.Tools)
 	_ = sink.finish(res)
 	s.note(endpoint, turn.Model, true, "", time.Since(start), res.Usage)
 }
@@ -314,6 +313,7 @@ func (o *openAIStream) tools(calls []ToolCall) error {
 }
 
 func (o *openAIStream) finish(res RunResult) error {
+	_ = o.tools(res.Tools)
 	finish := openAIFinish(res.Finish)
 	var usage any
 	if o.includeUsage {
@@ -454,6 +454,7 @@ func (a *anthropicStream) tools(calls []ToolCall) error {
 }
 
 func (a *anthropicStream) finish(res RunResult) error {
+	_ = a.tools(res.Tools)
 	a.blocks.close()
 	reason, seq := anthropicStop(res.Finish, res.StopMatch)
 	_ = WriteSSEEvent(a.w, "message_delta", map[string]any{
@@ -476,31 +477,42 @@ func (a *anthropicStream) fail(err error) {
 }
 
 type responsesStream struct {
-	w            http.ResponseWriter
-	fl           http.Flusher
-	srv          *Server
-	id           string
-	model        string
-	msgID        string
-	next         int
-	msgIndex     int
-	reasonIndex  int
-	reasonID     string
-	msgOpen      bool
-	reasonOpen   bool
-	reasonClosed bool
+	w           http.ResponseWriter
+	fl          http.Flusher
+	srv         *Server
+	id          string
+	model       string
+	msgID       string
+	msgIndex    int
+	reasonIndex int
+	reasonID    string
+	msgOpen     bool
+	reasonOpen  bool
+	definitions []ToolDef
+	output      []map[string]any
+}
+
+func (e *responsesStream) addItem(item map[string]any) int {
+	index := len(e.output)
+	e.output = append(e.output, item)
+	_ = e.event("response.output_item.added", map[string]any{
+		"type": "response.output_item.added", "output_index": index, "item": item,
+	})
+	return index
+}
+
+func (e *responsesStream) completeItem(index int, item map[string]any) {
+	e.output[index] = item
+	_ = e.event("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": index, "item": item,
+	})
 }
 
 func (e *responsesStream) reasoning(s string) error {
 	if !e.reasonOpen {
 		e.reasonOpen = true
-		e.reasonIndex = e.next
 		e.reasonID = newID("rs")
-		e.next++
-		_ = e.event("response.output_item.added", map[string]any{
-			"type": "response.output_item.added", "output_index": e.reasonIndex,
-			"item": map[string]any{"type": "reasoning", "id": e.reasonID, "summary": []any{}},
-		})
+		e.reasonIndex = e.addItem(map[string]any{"type": "reasoning", "id": e.reasonID, "summary": []any{}})
 	}
 	return e.event("response.reasoning_summary_text.delta", map[string]any{
 		"type": "response.reasoning_summary_text.delta", "output_index": e.reasonIndex, "delta": s,
@@ -513,15 +525,9 @@ func (e *responsesStream) text(piece string) error {
 	}
 	if !e.msgOpen {
 		e.msgOpen = true
-		e.msgIndex = e.next
-		e.next++
 		e.msgID = newID("msg")
-		_ = e.event("response.output_item.added", map[string]any{
-			"type": "response.output_item.added", "output_index": e.msgIndex,
-			"item": map[string]any{
-				"type": "message", "id": e.msgID, "role": "assistant", "status": "in_progress",
-				"content": []any{},
-			},
+		e.msgIndex = e.addItem(map[string]any{
+			"type": "message", "id": e.msgID, "role": "assistant", "status": "in_progress", "content": []any{},
 		})
 		_ = e.event("response.content_part.added", map[string]any{
 			"type": "response.content_part.added", "output_index": e.msgIndex, "content_index": 0,
@@ -534,25 +540,34 @@ func (e *responsesStream) text(piece string) error {
 }
 
 func (e *responsesStream) tools(calls []ToolCall) error {
-	base := e.next
-	if base == 0 {
-		base = 1
-	}
-	for i, tc := range calls {
-		item := map[string]any{
-			"type": "function_call", "id": newID("fc"), "call_id": tc.ID, "name": tc.Name, "arguments": tc.Arguments, "status": "completed",
-		}
-		_ = e.event("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": base + i, "item": item})
-		_ = e.event("response.function_call_arguments.done", map[string]any{
-			"type": "response.function_call_arguments.done", "output_index": base + i, "arguments": tc.Arguments,
+	for _, tc := range calls {
+		item, field, prefix := responseToolItem(tc, e.definitions)
+		added := maps.Clone(item)
+		added[field] = ""
+		added["status"] = "in_progress"
+		index := e.addItem(added)
+		_ = e.event(prefix+".delta", map[string]any{
+			"type": prefix + ".delta", "output_index": index, "item_id": item["id"], "delta": item[field],
 		})
-		_ = e.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": base + i, "item": item})
+		done := map[string]any{
+			"type": prefix + ".done", "output_index": index, "item_id": item["id"], "name": item["name"], field: item[field],
+		}
+		if namespace, ok := item["namespace"]; ok {
+			done["namespace"] = namespace
+		}
+		_ = e.event(prefix+".done", done)
+		e.completeItem(index, item)
 	}
 	return nil
 }
 
 func (e *responsesStream) finish(res RunResult) error {
-	e.closeReason(res.Reasoning)
+	if !e.reasonOpen && res.Reasoning != "" {
+		_ = e.reasoning(res.Reasoning)
+	}
+	if e.reasonOpen {
+		e.completeItem(e.reasonIndex, responseReasoning(e.reasonID, res.Reasoning))
+	}
 	if e.msgOpen {
 		_ = e.event("response.output_text.done", map[string]any{
 			"type": "response.output_text.done", "output_index": e.msgIndex, "content_index": 0, "text": res.Text,
@@ -561,15 +576,10 @@ func (e *responsesStream) finish(res RunResult) error {
 			"type": "response.content_part.done", "output_index": e.msgIndex, "content_index": 0,
 			"part": map[string]any{"type": "output_text", "text": res.Text, "annotations": []any{}},
 		})
-		_ = e.event("response.output_item.done", map[string]any{
-			"type": "response.output_item.done", "output_index": e.msgIndex,
-			"item": map[string]any{
-				"type": "message", "id": e.msgID, "role": "assistant", "status": "completed",
-				"content": []map[string]any{{"type": "output_text", "text": res.Text, "annotations": []any{}}},
-			},
-		})
+		e.completeItem(e.msgIndex, responseMessage(e.msgID, res.Text))
 	}
-	_ = e.event("response.completed", map[string]any{"type": "response.completed", "response": responseObject(e.id, e.model, res)})
+	_ = e.tools(res.Tools)
+	_ = e.event("response.completed", map[string]any{"type": "response.completed", "response": responseObject(e.id, e.model, res, e.output)})
 	e.srv.remember(e.id, res.SessionID)
 	return nil
 }
@@ -578,27 +588,13 @@ func (e *responsesStream) fail(err error) {
 	_ = e.event("error", map[string]any{"type": "error", "error": map[string]any{"message": err.Error(), "type": "upstream_error"}})
 }
 
-func (e *responsesStream) closeReason(text string) {
-	if !e.reasonOpen || e.reasonClosed {
-		return
-	}
-	e.reasonClosed = true
-	_ = e.event("response.output_item.done", map[string]any{
-		"type": "response.output_item.done", "output_index": e.reasonIndex,
-		"item": map[string]any{
-			"type": "reasoning", "id": e.reasonID,
-			"summary": []map[string]any{{"type": "summary_text", "text": text}},
-		},
-	})
-}
-
 func (e *responsesStream) event(name string, payload map[string]any) error {
 	err := WriteSSEEvent(e.w, name, payload)
 	flush(e.fl)
 	return err
 }
 
-func responseObject(id, model string, res RunResult) map[string]any {
+func responseObject(id, model string, res RunResult, output []map[string]any) map[string]any {
 	status := "completed"
 	if res.Finish == "length" {
 		status = "incomplete"
@@ -609,7 +605,7 @@ func responseObject(id, model string, res RunResult) map[string]any {
 		"created_at": createdUnix(),
 		"status":     status,
 		"model":      model,
-		"output":     responseOutput(res.Text, res.Reasoning, res.Tools),
+		"output":     output,
 		"usage": map[string]any{
 			"input_tokens":  res.Usage.Input,
 			"output_tokens": res.Usage.Completion(),
@@ -641,10 +637,10 @@ func (s *Server) execute(ctx context.Context, turn Turn, emit func(Delta) error)
 	if err != nil {
 		return RunResult{}, err
 	}
-	schema := toolSchema(turn.Tools, turn.ToolChoice)
+	clientTools := len(turn.Tools) > 0 && turn.ToolChoice.Mode != "none"
 	system := turn.System
 	native, _ := s.engine.(interface{ NativeTools() bool })
-	if schema != nil && (native == nil || !native.NativeTools()) {
+	if clientTools && (native == nil || !native.NativeTools()) {
 		system = withToolInstructions(system, turn.Tools, turn.ToolChoice)
 	}
 	if turn.MaxTokens > 0 {
@@ -664,8 +660,7 @@ func (s *Server) execute(ctx context.Context, turn Turn, emit func(Delta) error)
 		Prompt:      prompt,
 		Files:       files,
 		Variant:     turn.Variant,
-		ClientTools: schema != nil,
-		Schema:      schema,
+		ClientTools: clientTools,
 		SessionID:   turn.SessionID,
 		Tools:       turn.Tools,
 		ToolChoice:  turn.ToolChoice,

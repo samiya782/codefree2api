@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	errUsage           = errors.New("用法：codefree2api lines [plugin|space] [--remote <url>]... [--plugin-version <版本>] [--editor-version <版本>] [--space-version <版本>] <生成代码采纳行数> <新增代码有效总行>")
+	errUsage           = errors.New("用法：codefree2api lines [plugin|space [spec]] [--remote <url>]... [--plugin-version <版本>] [--editor-version <版本>] [--space-version <版本>] <生成代码采纳行数> <新增代码有效总行>")
 	errNotInteger      = errors.New("生成代码采纳行数和新增代码有效总行都要是非负整数")
 	errNotRepo         = errors.New("当前目录不是 git 仓库")
 	errNoRemote        = errors.New("仓库没有远端")
@@ -53,6 +53,7 @@ type lineArgs struct {
 	pluginVersion string
 	editorVersion string
 	spaceVersion  string
+	spaceSpec     bool
 }
 
 // Run reports the two integers the user supplied. It does not read a diff
@@ -166,8 +167,12 @@ func parseArgs(args []string) (lineArgs, error) {
 		}
 		positionals = append(positionals, a)
 	}
-	if len(positionals) == 3 && (positionals[0] == "plugin" || positionals[0] == "space") {
+	if len(positionals) >= 2 && (positionals[0] == "plugin" || positionals[0] == "space") {
 		out.client = positionals[0]
+		positionals = positionals[1:]
+	}
+	if out.client == "space" && len(positionals) == 3 && positionals[0] == "spec" {
+		out.spaceSpec = true
 		positionals = positionals[1:]
 	}
 	if len(positionals) != 2 {
@@ -176,7 +181,7 @@ func parseArgs(args []string) (lineArgs, error) {
 	if out.client == "" && (out.pluginVersion != "" || out.editorVersion != "" || out.spaceVersion != "") {
 		return lineArgs{}, errUsage
 	}
-	if out.client == "plugin" && out.spaceVersion != "" {
+	if out.client == "plugin" && (out.spaceVersion != "" || out.spaceSpec) {
 		return lineArgs{}, errUsage
 	}
 	if out.client == "space" && (out.pluginVersion != "" || out.editorVersion != "") {

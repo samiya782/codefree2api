@@ -34,6 +34,9 @@ func TestSpaceReport(t *testing.T) {
 			projectBody = string(body)
 			_, _ = io.WriteString(w, `{"project":{"id":12,"name":"Demo"}}`)
 		case recordPath:
+			if r.Header.Get("Content-Type") != "text/plain;charset=UTF-8" {
+				t.Fatal("content type")
+			}
 			dec := json.NewDecoder(strings.NewReader(string(body)))
 			dec.UseNumber()
 			var rec map[string]any
@@ -70,7 +73,48 @@ func TestSpaceReport(t *testing.T) {
 	if !strings.Contains(projectBody, `"clientType":"codefree-ide"`) || !strings.Contains(projectBody, `"version":"9.9.9"`) || !strings.Contains(projectBody, remote) {
 		t.Fatal("project")
 	}
-	assertSpaceRecords(t, records, "9.9.9", 12, "Demo", remote)
+	assertSpaceRecords(t, records, "codefree-ide", "ide_agent", "Craft", "9.9.9", 12, "Demo", remote)
+}
+
+func TestSpaceSpecReport(t *testing.T) {
+	const remote = "https://example.test/repo"
+	var records []map[string]any
+	var projectBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/api/acbackend/ideservice/v1/ide-releases":
+			_, _ = io.WriteString(w, `[{"version":"9.9.9"}]`)
+		case "/api/acbackend/usermanager/v1/users/project":
+			projectBody = string(body)
+			_, _ = io.WriteString(w, `{"project":{"id":12,"name":"Demo"}}`)
+		case recordPath:
+			if r.Header.Get("Content-Type") != "text/plain;charset=UTF-8" {
+				t.Fatal("content type")
+			}
+			dec := json.NewDecoder(strings.NewReader(string(body)))
+			dec.UseNumber()
+			var rec map[string]any
+			if err := dec.Decode(&rec); err != nil {
+				t.Fatal(err)
+			}
+			records = append(records, rec)
+			_, _ = io.WriteString(w, `{"optResult":0}`)
+		default:
+			t.Fatal("path")
+		}
+	}))
+	defer srv.Close()
+
+	opt, out := pluginOpt(t, srv)
+	err := Run(context.Background(), []string{"space", "spec", "--remote", remote, "8", "3"}, opt)
+	if err != nil || out.String() != "生成代码采纳行数 8\n新增代码有效总行 3\n" {
+		t.Fatal(err)
+	}
+	if !strings.Contains(projectBody, `"clientType":"codefree-ide"`) {
+		t.Fatal("project")
+	}
+	assertSpaceRecords(t, records, "codefree-ide-spec", "ide-digital-employee", "Unknown", "9.9.9", 12, "Demo", remote)
 }
 
 func TestSpaceVersionFlagSkipsLookup(t *testing.T) {
@@ -246,17 +290,31 @@ func TestSpaceZeroSkipsNetwork(t *testing.T) {
 	}
 }
 
-func assertSpaceRecords(t *testing.T, records []map[string]any, version string, projectID int64, projectName, remote string) {
+func assertSpaceRecords(t *testing.T, records []map[string]any, app, service, subKey, version string, projectID int64, projectName, remote string) {
 	t.Helper()
+	keys := []string{
+		"ide_agent_gen_code_line",
+		"ide_agent_gen_code_count",
+		"ide_agent_accepted_code_line",
+		"ide_agent_accepted_code_count",
+	}
+	if app == "codefree-ide-spec" {
+		keys = []string{
+			"agent_gen_code_line",
+			"agent_gen_code_count",
+			"agent_accepted_code_line",
+			"agent_accepted_code_count",
+		}
+	}
 	want := []struct {
 		key   string
 		count string
 		req   bool
 	}{
-		{"ide_agent_gen_code_line", "8", true},
-		{"ide_agent_gen_code_count", "1", false},
-		{"ide_agent_accepted_code_line", "8", true},
-		{"ide_agent_accepted_code_count", "1", false},
+		{keys[0], "8", true},
+		{keys[1], "1", false},
+		{keys[2], "8", true},
+		{keys[3], "1", false},
 	}
 	if len(records) != len(want) {
 		t.Fatal("count")
@@ -270,11 +328,11 @@ func assertSpaceRecords(t *testing.T, records []map[string]any, version string, 
 		if num, _ := rec["projectId"].(json.Number); num.String() != json.Number(intString(projectID)).String() && num.String() != intString(projectID) {
 			t.Fatal("projectId")
 		}
-		if rec["app"] != "codefree-ide" || rec["service"] != "ide_agent" || rec["time"] != "2026-01-02 05:03:04.008" {
+		if rec["app"] != app || rec["service"] != service || rec["time"] != "2026-01-02 05:03:04.008" {
 			t.Fatal("record")
 		}
 		client, _ := rec["client"].(map[string]any)
-		if client["type"] != spaceClientType() || client["version"] != version || client["gitUrl"] != remote || client["projectName"] != projectName {
+		if client["type"] != "ide-win32" || client["version"] != version || client["gitUrl"] != remote || client["projectName"] != projectName {
 			t.Fatal("client")
 		}
 		urls, _ := client["gitUrls"].([]any)
@@ -286,7 +344,7 @@ func assertSpaceRecords(t *testing.T, records []map[string]any, version string, 
 			t.Fatal("activities")
 		}
 		act, _ := activities[0].(map[string]any)
-		if act["key"] != item.key || act["subKey"] != "Unknown" {
+		if act["key"] != item.key || act["subKey"] != subKey {
 			t.Fatal("activity")
 		}
 		value, _ := act["value"].(map[string]any)
@@ -304,7 +362,7 @@ func assertSpaceRecords(t *testing.T, records []map[string]any, version string, 
 			t.Fatal("reqId")
 		}
 	}
-	if len(reqs) != 2 || reqs[0] == reqs[1] {
+	if len(reqs) != 2 || reqs[0] == "" || reqs[0] != reqs[1] {
 		t.Fatal("reqIds")
 	}
 }

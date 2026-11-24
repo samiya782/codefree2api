@@ -25,8 +25,12 @@ CodeFree Space 上报里的程序版本。缺省是 1.5.1，也可以在命令�
 _Avoid_: artifactVersion, 编辑器版本, 1.127.0
 
 **CodeFree Space 行数**:
-记在 CodeFree Space 上的一次行数上报。
-_Avoid_: space 行数, space lines
+记在 CodeFree Space 普通模式上的一次行数上报。
+_Avoid_: space 行数, space lines, 普通上报
+
+**CodeFree Space spec 行数**:
+记在 CodeFree Space 的 spec 模式上的一次行数上报。
+_Avoid_: 含 spec, spec 行数
 
 **生成代码采纳行数**:
 用户填写的整数，上报到研发云。codefree-o 自己改文件时，这个数等于该次改动新增的行与删除的行之和。本命令不从 diff 计算。

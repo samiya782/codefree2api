@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"runtime"
 
 	"codefree2api/internal/srd"
 )
@@ -39,25 +38,39 @@ func runSpace(ctx context.Context, parsed lineArgs, opt Options) error {
 		return srd.ErrLogin
 	}
 	stamp := formatTime(opt.Now())
+	appName := "codefree-ide"
+	service := "ide_agent"
+	subKey := "Craft"
+	prefix := "ide_agent_"
+	if parsed.spaceSpec {
+		appName = "codefree-ide-spec"
+		service = "ide-digital-employee"
+		subKey = "Unknown"
+		prefix = "agent_"
+	}
+	reqID, err := newNonce()
+	if err != nil {
+		return errReport
+	}
 	records := []struct {
 		key   string
 		count int64
 		req   bool
 	}{
-		{key: "ide_agent_gen_code_line", count: parsed.accepted, req: true},
-		{key: "ide_agent_gen_code_count", count: 1},
-		{key: "ide_agent_accepted_code_line", count: parsed.accepted, req: true},
-		{key: "ide_agent_accepted_code_count", count: 1},
+		{key: prefix + "gen_code_line", count: parsed.accepted, req: true},
+		{key: prefix + "gen_code_count", count: 1},
+		{key: prefix + "accepted_code_line", count: parsed.accepted, req: true},
+		{key: prefix + "accepted_code_count", count: 1},
 	}
 	for _, item := range records {
 		body := map[string]any{
 			"userid":    userID,
 			"projectId": projectID,
-			"app":       "codefree-ide",
-			"service":   "ide_agent",
+			"app":       appName,
+			"service":   service,
 			"time":      stamp,
 			"client": map[string]any{
-				"type":        spaceClientType(),
+				"type":        "ide-win32",
 				"version":     version,
 				"gitUrl":      gitURL,
 				"gitUrls":     urls,
@@ -65,25 +78,24 @@ func runSpace(ctx context.Context, parsed lineArgs, opt Options) error {
 			},
 			"activities": []any{map[string]any{
 				"key":    item.key,
-				"subKey": "Unknown",
+				"subKey": subKey,
 				"value":  map[string]any{"count": item.count},
 			}},
 		}
 		if item.req {
-			id, err := newNonce()
-			if err != nil {
-				return errReport
-			}
-			body["reqId"] = id
+			body["reqId"] = reqID
 		}
 		payload, err := srd.Marshal(body)
 		if err != nil {
 			return errReport
 		}
+		header := make(http.Header)
+		header.Set("Content-Type", "text/plain;charset=UTF-8")
 		status, raw, err := caller.Do(ctx, srd.Call{
 			Method:    http.MethodPost,
 			Path:      recordPath,
 			Body:      payload,
+			Header:    header,
 			ProjectID: fmtProject(projectID),
 			GitURLs:   urls,
 		})
@@ -92,13 +104,6 @@ func runSpace(ctx context.Context, parsed lineArgs, opt Options) error {
 		}
 	}
 	return writeCounts(opt.Stdout, parsed.accepted, parsed.effective)
-}
-
-func spaceClientType() string {
-	if runtime.GOOS == "windows" {
-		return "ide-win32"
-	}
-	return "ide-" + runtime.GOOS
 }
 
 func lookupSpaceVersion(ctx context.Context, caller *srd.Caller) string {

@@ -27,6 +27,45 @@ const (
 // It carries no token and no URL.
 var ErrLogin = errors.New("登录失败")
 
+// loginFailure names the failed step. The OAuth error code is included only
+// when it is a short token. Response bodies are not included.
+type loginFailure struct {
+	step   string
+	status int
+	code   string
+}
+
+func (e *loginFailure) Error() string {
+	switch {
+	case e.code != "":
+		return fmt.Sprintf("登录失败（%s %s）", e.step, e.code)
+	case e.status != 0:
+		return fmt.Sprintf("登录失败（%s HTTP %d）", e.step, e.status)
+	default:
+		return ErrLogin.Error()
+	}
+}
+
+func (e *loginFailure) Unwrap() error { return ErrLogin }
+
+func loginStep(step string, status int, body []byte) error {
+	return &loginFailure{step: step, status: status, code: oauthErrorCode(body)}
+}
+
+func oauthErrorCode(body []byte) string {
+	code := firstField(body, "error")
+	if code == "" || len(code) > 40 {
+		return ""
+	}
+	for _, r := range code {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
+			continue
+		}
+		return ""
+	}
+	return code
+}
+
 // LoginOptions opens one client's 研发云 login page and waits for the callback.
 type LoginOptions struct {
 	App    App
@@ -127,12 +166,15 @@ func exchange(ctx context.Context, opt LoginOptions, verifier, code string) (*Se
 	q.Set("code_verifier", verifier)
 	caller := &Caller{App: opt.App, HTTP: opt.HTTP, Now: opt.Now}
 	status, body, err := caller.Do(ctx, Call{Method: http.MethodGet, Path: tokenPath, Query: q, Unsigned: true})
-	if err != nil || status != http.StatusOK {
+	if err != nil {
 		return nil, ErrLogin
+	}
+	if status != http.StatusOK {
+		return nil, loginStep("令牌交换", status, body)
 	}
 	userID, sessionID, access := tokenFields(body)
 	if userID == "" || access == "" {
-		return nil, ErrLogin
+		return nil, loginStep("令牌交换", status, body)
 	}
 	now := time.Now()
 	if opt.Now != nil {
@@ -146,15 +188,18 @@ func exchange(ctx context.Context, opt LoginOptions, verifier, code string) (*Se
 		header.Set("sessionId", sessionID)
 	}
 	status, body, err = caller.Do(ctx, Call{Method: http.MethodGet, Path: userPath, Header: header, Unsigned: true})
-	if err != nil || status != http.StatusOK {
+	if err != nil {
 		return nil, ErrLogin
+	}
+	if status != http.StatusOK {
+		return nil, loginStep("用户信息", status, body)
 	}
 	cf := firstField(body, "x_cf_token")
 	if cf == "" {
 		cf = firstField(body, "access_token")
 	}
 	if cf == "" {
-		return nil, ErrLogin
+		return nil, loginStep("用户信息", status, body)
 	}
 	sess := &Session{UserID: userID, SessionID: sessionID, CFToken: cf}
 	takeRefresh(sess, tokenBody, now)
